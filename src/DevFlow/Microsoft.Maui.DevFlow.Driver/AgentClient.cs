@@ -789,6 +789,40 @@ public class AgentClient : IDisposable
     public Task<JsonElement> GetBleStatusAsync()
         => GetJsonAsync($"{DeviceApi}/ble");
 
+    /// <summary>
+    /// Enables the BLE monitor. Returns null on success, or the error message on failure
+    /// (e.g. missing Info.plist entries).
+    /// </summary>
+    public async Task<string?> EnableBleAsync()
+    {
+        try
+        {
+            using var content = DriverJson.CreateJsonContent(new JsonObject());
+            var response = await _http.PostAsync($"{_baseUrl}{DeviceApi}/ble/enable", content);
+            var body = await response.Content.ReadAsStringAsync();
+
+            if (response.IsSuccessStatusCode)
+            {
+                var result = DriverJson.Deserialize<ActionResponse>(body);
+                return result?.Success == true ? null : body;
+            }
+
+            // Extract the error message from the response
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                    return errorProp.GetString() ?? body;
+            }
+            catch { }
+            return body;
+        }
+        catch (Exception ex) { return ex.Message; }
+    }
+
+    public Task<bool> DisableBleAsync()
+        => PostActionAsync($"{DeviceApi}/ble/disable", new JsonObject());
+
     public Task<JsonElement> GetBleEventsAsync(int limit = 100, string? type = null)
     {
         var path = $"{DeviceApi}/ble/events?limit={limit}";

@@ -1,4 +1,4 @@
-#if IOS || MACCATALYST
+#if IOS || MACCATALYST || MACOS
 using CoreBluetooth;
 using Foundation;
 using Microsoft.Maui.DevFlow.Agent.Core;
@@ -8,175 +8,180 @@ namespace Microsoft.Maui.DevFlow.Agent.Ble;
 internal sealed class AppleBleMonitor : BleMonitor
 {
     private CBCentralManager? _centralManager;
-    private DevFlowCentralDelegate? _delegate;
-    private bool _snapshotTaken;
-
-    public AppleBleMonitor() : base()
-    {
-        // Create manager immediately so UpdatedState fires and we can snapshot connected devices
-        _delegate = new DevFlowCentralDelegate(this);
-        _centralManager = new CBCentralManager(_delegate, null);
-    }
+    private ICBCentralManagerDelegate? _originalCentralDelegate;
+    private CentralManagerDelegateWrapper? _centralWrapper;
+    private readonly Dictionary<IntPtr, PeripheralHookInfo> _trackedPeripherals = new();
+    private readonly object _hookGate = new();
+    private int _hookCount;
 
     public override bool SupportsScanning => true;
+    public override bool IsHooked => _centralManager != null;
+
+    public override void AttachCentralManager(object centralManager)
+    {
+        if (centralManager is not CBCentralManager cm)
+            throw new ArgumentException(
+                $"Expected CBCentralManager but got {centralManager.GetType().Name}.",
+                nameof(centralManager));
+
+        lock (_hookGate)
+        {
+            if (ReferenceEquals(_centralManager, cm))
+                return; // already hooked to this instance
+
+            if (_centralManager != null)
+                DetachCentralManagerLocked();
+
+            _centralManager = cm;
+            _originalCentralDelegate = cm.Delegate;
+            _centralWrapper = new CentralManagerDelegateWrapper(this, _originalCentralDelegate);
+            cm.Delegate = _centralWrapper;
+        }
+
+        RecordEvent(new BleEvent { Type = "central_manager_attached" });
+    }
+
+    public override void DetachCentralManager()
+    {
+        lock (_hookGate)
+        {
+            if (_centralManager == null)
+                return;
+
+            DetachCentralManagerLocked();
+        }
+
+        RecordEvent(new BleEvent { Type = "central_manager_detached" });
+    }
+
+    private void DetachCentralManagerLocked()
+    {
+        // Restore the original delegate only if ours is still in place
+        if (_centralManager != null &&
+            _centralWrapper != null &&
+            ReferenceEquals(_centralManager.Delegate, _centralWrapper))
+        {
+            _centralManager.Delegate = _originalCentralDelegate;
+        }
+
+        UnhookAllPeripheralsLocked();
+
+        _centralManager = null;
+        _originalCentralDelegate = null;
+        _centralWrapper = null;
+    }
+
+    internal void HookPeripheral(CBPeripheral peripheral)
+    {
+        lock (_hookGate)
+        {
+            var handle = peripheral.Handle;
+            if (_trackedPeripherals.ContainsKey(handle))
+                return;
+
+            var originalDelegate = peripheral.Delegate;
+            var wrapper = new PeripheralDelegateWrapper(this, originalDelegate);
+            peripheral.Delegate = wrapper;
+
+            _trackedPeripherals[handle] = new PeripheralHookInfo(peripheral, originalDelegate, wrapper);
+
+            _hookCount++;
+            if (_hookCount % 20 == 0)
+                CleanDeadReferencesLocked();
+        }
+    }
+
+    internal void UnhookPeripheral(CBPeripheral peripheral)
+    {
+        lock (_hookGate)
+        {
+            UnhookPeripheralLocked(peripheral.Handle);
+        }
+    }
+
+    private void UnhookPeripheralLocked(IntPtr handle)
+    {
+        if (!_trackedPeripherals.Remove(handle, out var info))
+            return;
+
+        if (!info.PeripheralRef.TryGetTarget(out var peripheral))
+            return;
+
+        // Only restore if our wrapper is still the delegate
+        if (ReferenceEquals(peripheral.Delegate, info.Wrapper))
+            peripheral.Delegate = info.OriginalDelegate;
+    }
+
+    private void UnhookAllPeripheralsLocked()
+    {
+        foreach (var handle in _trackedPeripherals.Keys.ToArray())
+            UnhookPeripheralLocked(handle);
+
+        _trackedPeripherals.Clear();
+    }
+
+    private void CleanDeadReferencesLocked()
+    {
+        var dead = _trackedPeripherals
+            .Where(kv => !kv.Value.PeripheralRef.TryGetTarget(out _))
+            .Select(kv => kv.Key)
+            .ToArray();
+
+        foreach (var handle in dead)
+            _trackedPeripherals.Remove(handle);
+    }
 
     protected override string? StartPlatformScan()
     {
-        if (_centralManager == null)
+        lock (_hookGate)
         {
-            _delegate = new DevFlowCentralDelegate(this);
-            _centralManager = new CBCentralManager(_delegate, null);
-        }
+            if (_centralManager == null)
+                return "No CBCentralManager attached. Call BleMonitor.Instance.AttachCentralManager(centralManager) first.";
 
-        // If already powered on, start immediately; otherwise UpdatedState will start it
-        if (_centralManager.State == CBManagerState.PoweredOn)
-        {
-            _centralManager.ScanForPeripherals(
-                (CBUUID[]?)null,
-                new PeripheralScanningOptions { AllowDuplicatesKey = true }
-            );
+            if (_centralManager.State == CBManagerState.PoweredOn)
+            {
+                _centralManager.ScanForPeripherals(
+                    (CBUUID[]?)null,
+                    new PeripheralScanningOptions { AllowDuplicatesKey = true });
+            }
+            // If not powered on yet, the CentralManagerDelegateWrapper.UpdatedState
+            // will start the scan when it transitions to PoweredOn.
+            return null;
         }
-
-        return null;
     }
 
     protected override void StopPlatformScan()
     {
-        if (_centralManager != null)
+        lock (_hookGate)
         {
-            try { _centralManager.StopScan(); }
-            catch { /* may already be stopped */ }
+            if (_centralManager != null)
+            {
+                try { _centralManager.StopScan(); }
+                catch { /* may already be stopped */ }
+            }
         }
-        // Don't dispose the manager — we still need it for connection events
     }
 
     protected override void DisposePlatform()
     {
-        _centralManager?.Dispose();
-        _centralManager = null;
-        _delegate?.Dispose();
-        _delegate = null;
+        lock (_hookGate)
+        {
+            if (_centralManager != null)
+                DetachCentralManagerLocked();
+        }
     }
 
-    internal void SnapshotConnectedDevices(CBCentralManager central)
+    private sealed class PeripheralHookInfo
     {
-        if (_snapshotTaken) return;
-        _snapshotTaken = true;
+        public WeakReference<CBPeripheral> PeripheralRef { get; }
+        public ICBPeripheralDelegate? OriginalDelegate { get; }
+        public PeripheralDelegateWrapper Wrapper { get; }
 
-        try
+        public PeripheralHookInfo(CBPeripheral peripheral, ICBPeripheralDelegate? originalDelegate, PeripheralDelegateWrapper wrapper)
         {
-            // Retrieve peripherals connected to any known GATT service
-            // An empty array returns nothing, so we pass common service UUIDs
-            // However, RetrieveConnectedPeripherals with no filter isn't possible.
-            // Instead, we can check for any peripherals connected system-wide.
-            // The most reliable approach: use common standard BLE service UUIDs.
-            var commonServices = new[]
-            {
-                CBUUID.FromString("180A"), // Device Information
-                CBUUID.FromString("180F"), // Battery Service
-                CBUUID.FromString("1800"), // Generic Access
-                CBUUID.FromString("1801"), // Generic Attribute
-                CBUUID.FromString("180D"), // Heart Rate
-                CBUUID.FromString("1812"), // HID
-            };
-
-            var peripherals = central.RetrieveConnectedPeripherals(commonServices);
-            if (peripherals == null) return;
-
-            // Deduplicate by identifier
-            var seen = new HashSet<string>();
-            foreach (var peripheral in peripherals)
-            {
-                var id = peripheral.Identifier.ToString();
-                if (seen.Add(id))
-                    RecordConnectionStateChanged(id, peripheral.Name, "connected");
-            }
-        }
-        catch { /* permissions may not be granted */ }
-    }
-
-    private sealed class DevFlowCentralDelegate : CBCentralManagerDelegate
-    {
-        private readonly AppleBleMonitor _monitor;
-
-        public DevFlowCentralDelegate(AppleBleMonitor monitor) => _monitor = monitor;
-
-        public override void UpdatedState(CBCentralManager central)
-        {
-            if (central.State == CBManagerState.PoweredOn)
-            {
-                _monitor.SnapshotConnectedDevices(central);
-
-                if (_monitor.IsScanning)
-                {
-                    central.ScanForPeripherals(
-                        (CBUUID[]?)null,
-                        new PeripheralScanningOptions { AllowDuplicatesKey = true }
-                    );
-                }
-            }
-            else
-            {
-                _monitor.RecordEvent(new BleEvent
-                {
-                    Type = "adapter_state_changed",
-                    Data = central.State.ToString()
-                });
-            }
-        }
-
-        public override void DiscoveredPeripheral(CBCentralManager central, CBPeripheral peripheral, NSDictionary advertisementData, NSNumber rssi)
-        {
-            _monitor.RecordScanResult(
-                peripheral.Identifier.ToString(),
-                peripheral.Name,
-                rssi.Int32Value,
-                FormatAdvertisementData(advertisementData)
-            );
-        }
-
-        public override void ConnectedPeripheral(CBCentralManager central, CBPeripheral peripheral)
-        {
-            _monitor.RecordConnectionStateChanged(
-                peripheral.Identifier.ToString(),
-                peripheral.Name,
-                "connected"
-            );
-        }
-
-        public override void DisconnectedPeripheral(CBCentralManager central, CBPeripheral peripheral, NSError? error)
-        {
-            _monitor.RecordConnectionStateChanged(
-                peripheral.Identifier.ToString(),
-                peripheral.Name,
-                "disconnected"
-            );
-        }
-
-        public override void FailedToConnectPeripheral(CBCentralManager central, CBPeripheral peripheral, NSError? error)
-        {
-            _monitor.RecordEvent(new BleEvent
-            {
-                Type = "connection_failed",
-                DeviceId = peripheral.Identifier.ToString(),
-                DeviceName = peripheral.Name,
-                Data = error?.LocalizedDescription
-            });
-        }
-
-        private static string? FormatAdvertisementData(NSDictionary? data)
-        {
-            if (data == null || data.Count == 0) return null;
-            var parts = new List<string>();
-            foreach (var key in data.Keys)
-            {
-                var value = data[key];
-                if (value is NSData nsData)
-                    parts.Add($"{key}={Convert.ToHexString(nsData.ToArray())}");
-                else
-                    parts.Add($"{key}={value}");
-            }
-            return string.Join(";", parts);
+            PeripheralRef = new WeakReference<CBPeripheral>(peripheral);
+            OriginalDelegate = originalDelegate;
+            Wrapper = wrapper;
         }
     }
 }

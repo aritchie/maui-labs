@@ -8,7 +8,27 @@ namespace Microsoft.Maui.Cli.DevFlow.Mcp.Tools;
 [McpServerToolType]
 public sealed class BleTools
 {
-	[McpServerTool(Name = "maui_ble_status"), Description("Get BLE monitor status including whether scanning is active, event count, and subscriber count.")]
+	[McpServerTool(Name = "maui_ble_enable"), Description("Enable the BLE monitor on the connected agent. Must be called before scanning or receiving BLE events. Returns an error if the app is missing required platform configuration (e.g. NSBluetoothAlwaysUsageDescription in Info.plist on iOS/macOS).")]
+	public static async Task<string> EnableBle(
+		McpAgentSession session,
+		[Description("Agent HTTP port (optional if only one agent connected)")] int? agentPort = null)
+	{
+		var agent = await session.GetAgentClientAsync(agentPort);
+		var error = await agent.EnableBleAsync();
+		return error ?? "BLE monitor enabled.";
+	}
+
+	[McpServerTool(Name = "maui_ble_disable"), Description("Disable the BLE monitor, stopping any active scan, unhooking all platform event receivers, and releasing native resources.")]
+	public static async Task<string> DisableBle(
+		McpAgentSession session,
+		[Description("Agent HTTP port (optional if only one agent connected)")] int? agentPort = null)
+	{
+		var agent = await session.GetAgentClientAsync(agentPort);
+		var success = await agent.DisableBleAsync();
+		return success ? "BLE monitor disabled." : "Failed to disable BLE monitor.";
+	}
+
+	[McpServerTool(Name = "maui_ble_status"), Description("Get BLE monitor status including whether it is enabled, scanning is active, event count, and subscriber count.")]
 	public static async Task<string> GetBleStatus(
 		McpAgentSession session,
 		[Description("Agent HTTP port (optional if only one agent connected)")] int? agentPort = null)

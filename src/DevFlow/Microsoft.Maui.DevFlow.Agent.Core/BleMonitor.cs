@@ -42,6 +42,28 @@ public class BleMonitor : IDisposable
 
     public virtual bool SupportsScanning => false;
 
+    /// <summary>
+    /// Whether a native BLE manager (e.g. CBCentralManager) is hooked for monitoring.
+    /// On Apple platforms, this becomes true after <see cref="AttachCentralManager"/> is called.
+    /// Always false on non-Apple platforms (Android/Windows use system-wide observers instead).
+    /// </summary>
+    public virtual bool IsHooked => false;
+
+    /// <summary>
+    /// On Apple platforms, attaches to the given CBCentralManager to intercept BLE traffic
+    /// by wrapping its delegate. The monitor will also automatically wrap delegates on
+    /// peripherals as they are discovered/connected.
+    /// No-op on non-Apple platforms.
+    /// </summary>
+    /// <param name="centralManager">A CBCentralManager instance (typed as object since Core has no CoreBluetooth reference).</param>
+    public virtual void AttachCentralManager(object centralManager) { }
+
+    /// <summary>
+    /// On Apple platforms, detaches from the previously attached CBCentralManager,
+    /// restoring all original delegates on both the manager and tracked peripherals.
+    /// </summary>
+    public virtual void DetachCentralManager() { }
+
     public virtual IReadOnlyList<string> SupportedFeatures
         => SupportsScanning
             ? ["status", "events", "scan", "stream"]
@@ -56,7 +78,8 @@ public class BleMonitor : IDisposable
                 scanning = _scanning,
                 eventCount = _eventCount,
                 subscribers = _subscribers.Count,
-                supportsScanning = SupportsScanning
+                supportsScanning = SupportsScanning,
+                hooked = IsHooked
             };
         }
     }

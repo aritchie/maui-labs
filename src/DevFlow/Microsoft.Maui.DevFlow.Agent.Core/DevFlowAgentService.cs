@@ -47,7 +47,7 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
     /// <summary>
     /// Monitors BLE scan results, connections, reads, writes, and notifications.
     /// </summary>
-    public BleMonitor Ble { get; }
+    public BleMonitor Ble { get; private set; }
 
     private readonly IProfilerCollector _profilerCollector;
     private readonly ProfilerSessionStore _profilerSessions;
@@ -254,7 +254,7 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
         _treeWalker = CreateTreeWalker();
         NetworkStore = new NetworkRequestStore(_options.MaxNetworkBufferSize);
         Sensors = new SensorManager();
-        Ble = CreateBleMonitor();
+        Ble = new BleMonitor();
         BleMonitor.Instance = Ble;
         _profilerCollector = CreateProfilerCollector();
         _profilerSessions = new ProfilerSessionStore(
@@ -307,6 +307,47 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
     /// to provide native scan and connection monitoring.
     /// </summary>
     protected virtual BleMonitor CreateBleMonitor() => new BleMonitor();
+
+    /// <summary>
+    /// Enables the platform BLE monitor at runtime. On Android/Windows this activates
+    /// system-wide connection watchers and scanning. On all platforms, the passive event
+    /// sink (BleMonitor.Instance.RecordEvent) is always available regardless.
+    /// </summary>
+    public string? EnableBleMonitor()
+    {
+        if (Ble.SupportsScanning)
+            return null; // already enabled
+
+        var oldBle = Ble;
+        var newBle = CreateBleMonitor();
+
+        // Transfer any events that were recorded into the passive sink before enable
+        foreach (var evt in oldBle.GetEvents(int.MaxValue))
+            newBle.RecordEvent(evt);
+
+        Ble = newBle;
+        BleMonitor.Instance = Ble;
+        oldBle.Dispose();
+        return null;
+    }
+
+    /// <summary>
+    /// Disables the platform BLE monitor, stopping any active scan, unhooking all platform
+    /// event receivers/watchers, and replacing with the passive-only monitor.
+    /// Events can still be recorded via BleMonitor.Instance.RecordEvent after disabling.
+    /// </summary>
+    public void DisableBleMonitor()
+    {
+        if (!Ble.SupportsScanning)
+            return; // already using the passive-only monitor
+
+        var oldBle = Ble;
+        Ble = new BleMonitor();
+        BleMonitor.Instance = Ble;
+        oldBle.Dispose(); // stops scan, unregisters receivers/watchers, releases native resources
+    }
+
+    public bool IsBleMonitorEnabled => Ble.SupportsScanning;
 
     /// <summary>Platform name for status reporting. Override for platforms without DeviceInfo.</summary>
     protected virtual string PlatformName => DeviceInfo.Current.Platform.ToString();
@@ -532,6 +573,8 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
         _server.MapGet("/api/v1/device/jobs", HandleJobsList);
         _server.MapPost("/api/v1/device/jobs/{identifier}/run", HandleJobRun);
         _server.MapGet("/api/v1/device/ble", HandleBleStatus);
+        _server.MapPost("/api/v1/device/ble/enable", HandleBleEnable);
+        _server.MapPost("/api/v1/device/ble/disable", HandleBleDisable);
         _server.MapGet("/api/v1/device/ble/events", HandleBleEvents);
         _server.MapPost("/api/v1/device/ble/scan/start", HandleBleScanStart);
         _server.MapPost("/api/v1/device/ble/scan/stop", HandleBleScanStop);
@@ -6335,7 +6378,26 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
 
     private Task<HttpResponse> HandleBleStatus(HttpRequest request)
     {
-        return Task.FromResult(HttpResponse.Json(Ble.GetStatus()));
+        var status = Ble.GetStatus();
+        return Task.FromResult(HttpResponse.Json(new
+        {
+            enabled = IsBleMonitorEnabled,
+            status
+        }));
+    }
+
+    private Task<HttpResponse> HandleBleEnable(HttpRequest request)
+    {
+        var error = EnableBleMonitor();
+        if (error != null)
+            return Task.FromResult(HttpResponse.Error(error, 400, "ble_requirements_not_met"));
+        return Task.FromResult(HttpResponse.Ok("BLE monitor enabled"));
+    }
+
+    private Task<HttpResponse> HandleBleDisable(HttpRequest request)
+    {
+        DisableBleMonitor();
+        return Task.FromResult(HttpResponse.Ok("BLE monitor disabled"));
     }
 
     private Task<HttpResponse> HandleBleEvents(HttpRequest request)

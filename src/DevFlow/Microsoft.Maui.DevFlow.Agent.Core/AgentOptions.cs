@@ -115,4 +115,5 @@ public class AgentOptions
     /// Default: false to avoid broad attachment overhead.
     /// </summary>
     public bool EnableDetailedUiHooks { get; set; } = false;
+
 }

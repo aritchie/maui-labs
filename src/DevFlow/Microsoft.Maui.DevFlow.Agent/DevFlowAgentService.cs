@@ -498,12 +498,10 @@ public class PlatformAgentService : DevFlowAgentService
     {
 #if ANDROID
         return new Ble.AndroidBleMonitor();
-#elif IOS || MACCATALYST
+#elif IOS || MACCATALYST || MACOS
         return new Ble.AppleBleMonitor();
 #elif WINDOWS
         return new Ble.WindowsBleMonitor();
-#elif MACOS
-        return new Ble.MacOsBleMonitor();
 #else
         return base.CreateBleMonitor();
 #endif

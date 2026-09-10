@@ -112,7 +112,8 @@ public class AgentHttpServerBodyTests
 
                 // Reading the response is what proves the handler ran before the assertions.
                 var buffer = new byte[1024];
-                await stream.ReadAsync(buffer);
+                var read = await stream.ReadAsync(buffer);
+                Assert.True(read > 0, "The server closed the connection without answering.");
                 return;
             }
             catch (SocketException) when (attempt < 9) { await Task.Delay(100); }

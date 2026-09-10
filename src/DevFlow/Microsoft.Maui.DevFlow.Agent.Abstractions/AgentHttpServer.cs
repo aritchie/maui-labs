@@ -1,4 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -887,8 +886,10 @@ public class HttpRequest
 
     private static readonly JsonSerializerOptions _readOptions = new() { PropertyNameCaseInsensitive = true };
 
-    [RequiresUnreferencedCode("Reflection-based deserialization. Prefer the JsonTypeInfo overload.")]
-    [RequiresDynamicCode("Reflection-based deserialization. Prefer the JsonTypeInfo overload.")]
+    /// <summary>
+    /// Reflection-based. Prefer the <see cref="JsonTypeInfo{T}"/> overload for anything new - it is
+    /// the one that survives trimming and AOT.
+    /// </summary>
     public T? BodyAs<T>() where T : class
         => Body != null ? JsonSerializer.Deserialize<T>(Body, _readOptions) : null;
 
@@ -909,15 +910,16 @@ public class HttpResponse
     public byte[]? BodyBytes { get; set; }
     public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    [RequiresUnreferencedCode("Reflection-based serialization. Prefer the JsonTypeInfo overload.")]
-    [RequiresDynamicCode("Reflection-based serialization. Prefer the JsonTypeInfo overload.")]
+    /// <summary>
+    /// Reflection-based. Prefer the <see cref="JsonTypeInfo{T}"/> overload for anything new - it is
+    /// the one that survives trimming and AOT.
+    /// </summary>
     public static HttpResponse Json(object data) => new()
     {
         Body = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true })
     };
 
-    [RequiresUnreferencedCode("Reflection-based serialization. Prefer the JsonTypeInfo overload.")]
-    [RequiresDynamicCode("Reflection-based serialization. Prefer the JsonTypeInfo overload.")]
+    /// <inheritdoc cref="Json(object)"/>
     public static HttpResponse Json(object data, int statusCode) => new()
     {
         StatusCode = statusCode,
@@ -993,8 +995,7 @@ public class HttpResponse
     private static string? NullIfBlank(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value;
 
-    [RequiresUnreferencedCode("The details payload is caller-supplied and cannot be source-generated.")]
-    [RequiresDynamicCode("The details payload is caller-supplied and cannot be source-generated.")]
+    /// <summary>The details payload is caller-supplied, so this one cannot be source-generated.</summary>
     private static string SerializeErrorWithDetails(string message, string? reason, object details)
     {
         var body = new Dictionary<string, object?>

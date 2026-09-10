@@ -52,7 +52,7 @@ public class AgentHttpServerBodyTests
         server.Start();
 
         // Two chunks, written with a pause between them, so the reader has to come back for more.
-        await SendRawAsync(server.Port, write: async stream =>
+        var answered = await SendRawAsync(server.Port, write: async stream =>
         {
             await WriteAsciiAsync(stream, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n");
             await WriteAsciiAsync(stream, "9\r\n{\"a\":1,\"b\r\n");
@@ -60,7 +60,32 @@ public class AgentHttpServerBodyTests
             await WriteAsciiAsync(stream, "6\r\n\":2}\r\n\r\n0\r\n\r\n");
         });
 
+        Assert.True(answered > 0, "The server closed the connection without answering.");
         Assert.Equal("{\"a\":1,\"b\":2}\r\n", seen);
+    }
+
+    [Fact]
+    public async Task ChunkedRequestBody_WithAMissingChunkTerminator_IsRefused()
+    {
+        using var server = new AgentHttpServer(GetFreePort());
+        var handlerRan = false;
+        server.MapPost("/echo", request =>
+        {
+            handlerRan = true;
+            return Task.FromResult(HttpResponse.Ok("read"));
+        }, requiresMutationLease: false);
+        server.Start();
+
+        // "5\r\nhelloXX" - the chunk is the right length but what follows it is not CRLF. Skipping
+        // two bytes on faith would put everything after this out of step with the length lines.
+        var answered = await SendRawAsync(server.Port, write: async stream =>
+        {
+            await WriteAsciiAsync(stream, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n");
+            await WriteAsciiAsync(stream, "5\r\nhelloXX0\r\n\r\n");
+        });
+
+        Assert.False(handlerRan, "A request with malformed chunk framing should never reach a handler.");
+        Assert.Equal(0, answered);
     }
 
     [Fact]
@@ -98,7 +123,15 @@ public class AgentHttpServerBodyTests
         }
     }
 
-    private static async Task SendRawAsync(int port, Func<NetworkStream, Task> write)
+    /// <summary>
+    /// Writes a request byte for byte and answers with how many bytes came back.
+    /// </summary>
+    /// <remarks>
+    /// The count is the point: a request the server accepted is answered, and one it refused as
+    /// malformed has its connection closed with nothing written. Both are outcomes worth asserting
+    /// on, so this reports rather than assumes.
+    /// </remarks>
+    private static async Task<int> SendRawAsync(int port, Func<NetworkStream, Task> write)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -110,11 +143,8 @@ public class AgentHttpServerBodyTests
 
                 await write(stream);
 
-                // Reading the response is what proves the handler ran before the assertions.
                 var buffer = new byte[1024];
-                var read = await stream.ReadAsync(buffer);
-                Assert.True(read > 0, "The server closed the connection without answering.");
-                return;
+                return await stream.ReadAsync(buffer);
             }
             catch (SocketException) when (attempt < 9) { await Task.Delay(100); }
         }

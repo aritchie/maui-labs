@@ -24,6 +24,9 @@ public class AgentHttpServer : IDisposable
 
     /// <summary>Header block ceiling. A request still short of its blank line past this is not one we want.</summary>
     private const int MaxHeaderBytes = 64 * 1024;
+
+    /// <summary>How long a body read waits for the next block before giving the connection up.</summary>
+    private static readonly TimeSpan BodyIdleTimeout = TimeSpan.FromSeconds(15);
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _listenTask;
@@ -365,7 +368,9 @@ public class AgentHttpServer : IDisposable
                 {
                     while (copied < contentLength)
                     {
-                        var read = await stream.ReadAsync(bodyBytes.AsMemory(copied, contentLength - copied), ct).ConfigureAwait(false);
+                        var read = await ReadWithIdleTimeoutAsync(
+                            stream, bodyBytes.AsMemory(copied, contentLength - copied), ct).ConfigureAwait(false);
+
                         if (read == 0) break;
                         copied += read;
                     }
@@ -439,10 +444,35 @@ public class AgentHttpServer : IDisposable
             }
 
             body.Write(pending.GetBuffer(), pos, chunkSize);
-            pos += chunkSize + 2;
+            pos += chunkSize;
+
+            // Every chunk ends with CRLF. Skipping two bytes without checking would quietly accept
+            // malformed framing and put the following bytes out of step with the length lines.
+            var terminator = pending.GetBuffer();
+            if (terminator[pos] != (byte)'\r' || terminator[pos + 1] != (byte)'\n')
+                return null;
+
+            pos += 2;
         }
 
         return body.ToArray();
+    }
+
+    /// <summary>
+    /// Reads once, giving up if nothing arrives for <see cref="BodyIdleTimeout"/>.
+    /// </summary>
+    /// <remarks>
+    /// Idle rather than a deadline on the whole body, and the 64MB ceiling is why: a large upload
+    /// over a slow link is legitimate and can take a while, but a client that has stopped sending
+    /// should not hold a server task open. Resetting on every block distinguishes the two.
+    /// </remarks>
+    private static async Task<int> ReadWithIdleTimeoutAsync(
+        NetworkStream stream, Memory<byte> destination, CancellationToken ct)
+    {
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        idle.CancelAfter(BodyIdleTimeout);
+
+        return await stream.ReadAsync(destination, idle.Token).ConfigureAwait(false);
     }
 
     /// <summary>Reads one more block onto the end of <paramref name="pending"/>. False at end of stream.</summary>
@@ -452,7 +482,7 @@ public class AgentHttpServer : IDisposable
         int read;
         try
         {
-            read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+            read = await ReadWithIdleTimeoutAsync(stream, buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
         }
         catch { return false; }
 

@@ -264,6 +264,55 @@ public class SqliteBrowserTests
         Assert.Contains("already called", result.GetProperty("error").GetString());
     }
 
+    [Fact]
+    public async Task Rows_AreFoundWhateverCaseTheTableIsAskedForIn()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        // SQLite resolves PEOPLE to people, so refusing this would refuse a name the engine accepts.
+        var result = await fixture.Client.GetDatabaseRowsAsync("app.db", "PeOpLe");
+
+        Assert.Null(GetError(result));
+        Assert.Equal(2, result.GetProperty("rows").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task Update_AcceptsATableAndColumnInAnyCase()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        var result = await fixture.Client.UpdateDatabaseRowAsync("app.db", "PEOPLE", 1, [("NAME", "Ada L")]);
+
+        Assert.Null(GetError(result));
+
+        // Read back under the spelling the table actually uses, to show the write landed there.
+        var rows = await fixture.Client.GetDatabaseRowsAsync("app.db", "people");
+        Assert.Equal("Ada L", rows.GetProperty("rows")[0][1].GetString());
+    }
+
+    [Fact]
+    public async Task Update_StillRefusesAColumnThatDoesNotExistInAnyCase()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        var result = await fixture.Client.UpdateDatabaseRowAsync("app.db", "people", 1, [("nope", "x")]);
+
+        Assert.Contains("has no column called", GetError(result));
+    }
+
+    [Fact]
+    public async Task Query_TreatsANonPositiveRowCapAsTheDefault()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        // 0 passed straight through would answer every statement with no rows and truncated: true.
+        var result = await fixture.Client.QueryDatabaseAsync("app.db", "SELECT * FROM people", maxRows: 0);
+
+        Assert.Null(GetError(result));
+        Assert.Equal(2, result.GetProperty("rows").GetArrayLength());
+        Assert.False(result.GetProperty("truncated").GetBoolean());
+    }
+
     private static string? GetError(JsonElement result)
         => result.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.String
             ? error.GetString()

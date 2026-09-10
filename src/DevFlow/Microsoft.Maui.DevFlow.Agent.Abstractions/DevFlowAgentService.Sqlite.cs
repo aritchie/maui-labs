@@ -89,8 +89,12 @@ public partial class DevFlowAgentService
             // DDL. A root that does not allow uploads does not allow this either.
             var fullPath = ResolveDatabasePath(request, writing: true);
 
+            // A non-positive cap means "use the default", the same as on the rows route. Passing 0
+            // through would answer every statement with no rows and truncated: true.
+            var maxRows = body.MaxRows is > 0 ? body.MaxRows.Value : DefaultSqliteMaxRows;
+
             return Task.FromResult(HttpResponse.Json(
-                SqliteBrowser.Query(fullPath, body.Sql, body.MaxRows ?? DefaultSqliteMaxRows),
+                SqliteBrowser.Query(fullPath, body.Sql, maxRows),
                 AgentJsonContext.Default.SqliteQueryResponse));
         }
         catch (FileNotFoundException ex)

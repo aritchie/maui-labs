@@ -575,10 +575,23 @@ internal static class SqliteBrowser
         => Find(connection, requested, "type IN ('table', 'view')")
             ?? throw new InvalidOperationException($"There is nothing called '{requested}' in this database.");
 
+    /// <summary>
+    /// The table or view as <c>sqlite_master</c> spells it, matched the way SQLite itself matches
+    /// identifiers.
+    /// </summary>
+    /// <remarks>
+    /// NOCASE, not an exact match: SQLite resolves <c>PEOPLE</c> to <c>people</c>, so an exact match
+    /// would reject a name the engine would have accepted. It is also what makes the answer useful -
+    /// the point of looking the name up is to get the database's spelling rather than the caller's,
+    /// and an exact match can only ever hand back what it was given.
+    ///
+    /// No ambiguity to worry about: SQLite refuses to create two tables whose names differ only by
+    /// case, so at most one row can match.
+    /// </remarks>
     private static string? Find(SqliteConnection connection, string requested, string kinds)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT name FROM sqlite_master WHERE {kinds} AND name = $name";
+        command.CommandText = $"SELECT name FROM sqlite_master WHERE {kinds} AND name = $name COLLATE NOCASE";
         command.Parameters.AddWithValue("$name", requested);
 
         return command.ExecuteScalar() as string;
@@ -588,8 +601,13 @@ internal static class SqliteBrowser
     /// The column as the database spells it, or an error naming what was asked for. What goes into
     /// the statement is this answer, never the caller's string.
     /// </summary>
+    /// <remarks>
+    /// Matched without regard to case, for the same reason <see cref="Find"/> is: SQLite resolves
+    /// <c>NAME</c> to <c>Name</c>, so anything stricter would refuse an edit the engine would have
+    /// accepted - and would hand back the caller's spelling rather than the table's.
+    /// </remarks>
     private static string FindColumn(List<SqliteColumn> columns, string table, string? requested)
-        => columns.FirstOrDefault(x => string.Equals(x.Name, requested, StringComparison.Ordinal))?.Name
+        => columns.FirstOrDefault(x => string.Equals(x.Name, requested, StringComparison.OrdinalIgnoreCase))?.Name
             ?? throw new InvalidOperationException($"'{table}' has no column called '{requested}'.");
 
     // ── Shared shapes ──

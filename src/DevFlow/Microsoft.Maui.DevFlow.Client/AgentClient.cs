@@ -2789,7 +2789,11 @@ public class AgentClient : IDisposable
         {
             var cells = new JsonArray();
             foreach (var (column, value) in values)
-                cells.Add(new JsonObject { ["column"] = column, ["value"] = value });
+            {
+                // Cast so this binds to Add(JsonNode?) rather than the generic Add<T>, which is
+                // neither trim- nor AOT-safe. Same reason as BuildBatchBody above.
+                cells.Add((JsonNode?)new JsonObject { ["column"] = column, ["value"] = value });
+            }
 
             body["values"] = cells;
         }

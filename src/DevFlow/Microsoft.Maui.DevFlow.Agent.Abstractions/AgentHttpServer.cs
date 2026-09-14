@@ -25,6 +25,18 @@ public class AgentHttpServer : IDisposable
     /// <summary>Header block ceiling. A request still short of its blank line past this is not one we want.</summary>
     private const int MaxHeaderBytes = 64 * 1024;
 
+    /// <summary>
+    /// Longest chunk-size line accepted. The size is eight hex digits at most; the rest is extensions,
+    /// which nothing here reads and nothing legitimate makes long.
+    /// </summary>
+    private const int MaxChunkLineBytes = 1024;
+
+    /// <summary>
+    /// Size lines and CRLFs one chunked body may spend on top of the body itself. A 64MB upload in 4KB
+    /// chunks costs about 130KB of framing.
+    /// </summary>
+    private const int MaxChunkFramingBytes = 1024 * 1024;
+
     /// <summary>How long a body read waits for the next block before giving the connection up.</summary>
     private static readonly TimeSpan BodyIdleTimeout = TimeSpan.FromSeconds(15);
     private TcpListener? _listener;
@@ -412,14 +424,32 @@ public class AgentHttpServer : IDisposable
         var body = new MemoryStream();
         var pos = 0;
 
+        // Size lines and CRLFs, counted separately from the body. The body ceiling says nothing about
+        // them, and without a bound of their own a stream of empty extensions is a body of no bytes
+        // that never finishes arriving.
+        var framing = 0L;
+
         while (true)
         {
             int lineEnd;
             while ((lineEnd = IndexOfCrLf(pending.GetBuffer(), pos, (int)pending.Length)) < 0)
             {
+                // Everything unread is part of the one line, so past the longest a line may be there
+                // is nothing more to wait for.
+                if (pending.Length - pos > MaxChunkLineBytes)
+                    return null;
+
+                Discard(pending, ref pos);
                 if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
                     return null;
             }
+
+            if (lineEnd - pos > MaxChunkLineBytes)
+                return null;
+
+            framing += lineEnd - pos + 2;
+            if (framing > MaxChunkFramingBytes)
+                return null;
 
             var sizeText = Encoding.ASCII.GetString(pending.GetBuffer(), pos, lineEnd - pos);
             var extension = sizeText.IndexOf(';');
@@ -436,15 +466,30 @@ public class AgentHttpServer : IDisposable
             if (body.Length + chunkSize > MaxRequestBodyBytes)
                 throw new RequestBodyTooLargeException();
 
-            // The chunk plus its trailing CRLF.
-            while (pending.Length - pos < chunkSize + 2)
+            // Moved into the body as it arrives rather than once the whole chunk is buffered, so a
+            // chunk the size of the ceiling is held once rather than twice.
+            var remaining = chunkSize;
+            while (true)
             {
+                var available = (int)Math.Min(pending.Length - pos, remaining);
+                body.Write(pending.GetBuffer(), pos, available);
+                pos += available;
+                remaining -= available;
+
+                if (remaining == 0)
+                    break;
+
+                Discard(pending, ref pos);
                 if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
                     return null;
             }
 
-            body.Write(pending.GetBuffer(), pos, chunkSize);
-            pos += chunkSize;
+            while (pending.Length - pos < 2)
+            {
+                Discard(pending, ref pos);
+                if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
+                    return null;
+            }
 
             // Every chunk ends with CRLF. Skipping two bytes without checking would quietly accept
             // malformed framing and put the following bytes out of step with the length lines.
@@ -453,6 +498,9 @@ public class AgentHttpServer : IDisposable
                 return null;
 
             pos += 2;
+            framing += 2;
+            if (framing > MaxChunkFramingBytes)
+                return null;
         }
 
         return body.ToArray();
@@ -494,6 +542,22 @@ public class AgentHttpServer : IDisposable
         pending.Write(buffer, 0, read);
         pending.Position = resume;
         return true;
+    }
+
+    /// <summary>
+    /// Drops the bytes before <paramref name="pos"/>, which have been parsed, so the buffer holds what
+    /// is still to be read rather than everything the connection has sent.
+    /// </summary>
+    private static void Discard(MemoryStream pending, ref int pos)
+    {
+        if (pos == 0)
+            return;
+
+        var unread = (int)pending.Length - pos;
+        var buffer = pending.GetBuffer();
+        Buffer.BlockCopy(buffer, pos, buffer, 0, unread);
+        pending.SetLength(unread);
+        pos = 0;
     }
 
     /// <summary>Offset of the CRLFCRLF that ends the header block, or -1 while it is still incoming.</summary>

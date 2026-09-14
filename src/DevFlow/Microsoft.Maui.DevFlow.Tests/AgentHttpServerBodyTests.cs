@@ -89,6 +89,91 @@ public class AgentHttpServerBodyTests
     }
 
     [Fact]
+    public async Task ChunkedRequestBody_WithASizeLineThatNeverEnds_IsRefusedWithoutWaitingItOut()
+    {
+        using var server = new AgentHttpServer(GetFreePort());
+        var handlerRan = false;
+        server.MapPost("/echo", request =>
+        {
+            handlerRan = true;
+            return Task.FromResult(HttpResponse.Ok("read"));
+        }, requiresMutationLease: false);
+        server.Start();
+
+        // An extension that never reaches its CRLF. Waiting for the line end buffers every byte of it,
+        // and a sender that keeps the bytes coming never trips the idle timeout either.
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var answered = await SendRawAsync(server.Port, write: async stream =>
+        {
+            await WriteAsciiAsync(stream, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n1;");
+            await WriteAsciiAsync(stream, new string('x', 64 * 1024));
+        });
+
+        Assert.False(handlerRan);
+        Assert.Equal(0, answered);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"Refused only after {watch.Elapsed}, which is the idle timeout rather than the line limit.");
+    }
+
+    [Fact]
+    public async Task ChunkedRequestBody_WhoseFramingOutweighsAnyRealBody_IsRefused()
+    {
+        using var server = new AgentHttpServer(GetFreePort());
+        var handlerRan = false;
+        server.MapPost("/echo", request =>
+        {
+            handlerRan = true;
+            return Task.FromResult(HttpResponse.Ok("read"));
+        }, requiresMutationLease: false);
+        server.Start();
+
+        // Two megabytes on the wire for a two-kilobyte body: every line is legal on its own, and the
+        // body ceiling never comes into it.
+        var framing = new StringBuilder();
+        var extension = new string('x', 1000);
+        for (var i = 0; i < 2000; i++)
+            framing.Append("1;").Append(extension).Append("\r\nA\r\n");
+        framing.Append("0\r\n\r\n");
+
+        var answered = await SendRawAsync(server.Port, write: async stream =>
+        {
+            await WriteAsciiAsync(stream, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n");
+            await WriteAsciiAsync(stream, framing.ToString());
+        });
+
+        Assert.False(handlerRan, "A body that is almost all framing should never reach a handler.");
+        Assert.Equal(0, answered);
+    }
+
+    [Fact]
+    public async Task ChunkedRequestBody_OfManyTinyChunks_StillArrivesWhole()
+    {
+        using var server = new AgentHttpServer(GetFreePort());
+        string? seen = null;
+        server.MapPost("/echo", request =>
+        {
+            seen = request.Body;
+            return Task.FromResult(HttpResponse.Ok("read"));
+        }, requiresMutationLease: false);
+        server.Start();
+
+        // Ten thousand chunks, so the parsed bytes are dropped many times over along the way.
+        var chunks = new StringBuilder();
+        for (var i = 0; i < 10_000; i++)
+            chunks.Append("4\r\nabcd\r\n");
+        chunks.Append("0\r\n\r\n");
+
+        var answered = await SendRawAsync(server.Port, write: async stream =>
+        {
+            await WriteAsciiAsync(stream, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n");
+            await WriteAsciiAsync(stream, chunks.ToString());
+        });
+
+        Assert.True(answered > 0, "The server closed the connection without answering.");
+        Assert.Equal(40_000, seen?.Length);
+        Assert.Equal(string.Concat(Enumerable.Repeat("abcd", 10_000)), seen);
+    }
+
+    [Fact]
     public async Task BinaryRequestBody_IsNotMangledByTextDecoding()
     {
         using var server = new AgentHttpServer(GetFreePort());
@@ -141,10 +226,19 @@ public class AgentHttpServerBodyTests
                 await client.ConnectAsync(IPAddress.Loopback, port);
                 await using var stream = client.GetStream();
 
-                await write(stream);
+                try
+                {
+                    await write(stream);
 
-                var buffer = new byte[1024];
-                return await stream.ReadAsync(buffer);
+                    var buffer = new byte[1024];
+                    return await stream.ReadAsync(buffer);
+                }
+                catch (IOException)
+                {
+                    // The server hung up while the request was still being written - which is how a
+                    // refusal lands when there is more request than the server was willing to read.
+                    return 0;
+                }
             }
             catch (SocketException) when (attempt < 9) { await Task.Delay(100); }
         }

@@ -1,9 +1,13 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using System.Xml.Linq;
 using Microsoft.Data.Sqlite;
 using Microsoft.Maui.DevFlow.Agent.Core;
+using Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
 using Microsoft.Maui.DevFlow.Driver;
+using SQLitePCL;
 
 namespace Microsoft.Maui.DevFlow.Tests;
 
@@ -98,8 +102,8 @@ public class SqliteBrowserTests
     {
         await using var fixture = await Fixture.CreateAsync();
 
-        // ExecuteReader stops at the first statement that produces rows, so this only does what it
-        // looks like if result sets are walked.
+        // The script only does what it looks like if every statement runs, not just the one whose rows
+        // are shown.
         var result = await fixture.Client.QueryDatabaseAsync(
             "app.db",
             "UPDATE people SET email = 'ada@lovelace.example' WHERE name = 'Ada'; SELECT email FROM people WHERE name = 'Ada'");
@@ -313,6 +317,147 @@ public class SqliteBrowserTests
         Assert.False(result.GetProperty("truncated").GetBoolean());
     }
 
+    [Fact]
+    public async Task Rows_OfATableWithItsOwnRowidColumn_AreAddressedByTheRealRowid()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        // A declared column called rowid, holding the same value twice. "WHERE rowid = 1" means this
+        // column now, so an edit addressed that way would change both records.
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            "CREATE TABLE tags (rowid INTEGER, label TEXT); INSERT INTO tags VALUES (1, 'first'), (1, 'second');");
+
+        var rows = await fixture.Client.GetDatabaseRowsAsync("app.db", "tags");
+        Assert.Equal(["rowid", "label"], rows.GetProperty("columns").EnumerateArray().Select(x => x.GetString()));
+        Assert.Equal([1L, 2L], rows.GetProperty("rowIds").EnumerateArray().Select(x => x.GetInt64()));
+
+        var updated = await fixture.Client.UpdateDatabaseRowAsync("app.db", "tags", 1, [("label", "changed")]);
+        Assert.Null(GetError(updated));
+        Assert.Equal(1, updated.GetProperty("rowsAffected").GetInt32());
+
+        var deleted = await fixture.Client.DeleteDatabaseRowAsync("app.db", "tags", 2);
+        Assert.Equal(1, deleted.GetProperty("rowsAffected").GetInt32());
+
+        var left = await fixture.Client.QueryDatabaseAsync("app.db", "SELECT label FROM tags");
+        Assert.Equal(["changed"], left.GetProperty("rows").EnumerateArray().Select(x => x[0].GetString()));
+    }
+
+    [Fact]
+    public async Task Rows_OfATableThatHasTakenEveryRowidName_AreReadOnly()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            "CREATE TABLE opaque (rowid INTEGER, _rowid_ INTEGER, oid INTEGER); INSERT INTO opaque VALUES (1, 1, 1);");
+
+        var schema = await fixture.Client.GetDatabaseSchemaAsync("app.db");
+        var opaque = schema.GetProperty("tables").EnumerateArray().Single(x => x.GetProperty("name").GetString() == "opaque");
+        Assert.False(opaque.GetProperty("hasRowId").GetBoolean());
+
+        var rows = await fixture.Client.GetDatabaseRowsAsync("app.db", "opaque");
+        Assert.Equal(1, rows.GetProperty("rows").GetArrayLength());
+        Assert.Empty(rows.GetProperty("rowIds").EnumerateArray());
+
+        var refused = await fixture.Client.UpdateDatabaseRowAsync("app.db", "opaque", 1, [("oid", "2")]);
+        Assert.Contains("cannot be edited", GetError(refused));
+    }
+
+    [Fact]
+    public async Task Rows_OfAViewThatNeverFinishes_AreStoppedAtTheDeadline()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db", EndlessView);
+
+        // Opening a view in the grid is a query like any other, and this one never produces a row.
+        var result = await Task.Run(() => SqliteBrowser.ReadRows(fixture.DatabasePath, "endless", 10, TimeSpan.FromMilliseconds(500)))
+            .WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Contains("was stopped", result.Error);
+    }
+
+    [Fact]
+    public async Task Update_WhoseTriggerNeverFinishes_IsStoppedAtTheDeadlineAndChangesNothing()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            EndlessView + "; CREATE TRIGGER stall AFTER UPDATE ON counters BEGIN SELECT count(*) FROM endless; END;");
+
+        // Changing one cell runs the trigger, and the trigger holds the write lock for as long as it runs.
+        var result = await Task.Run(() => SqliteBrowser.UpdateRow(
+                fixture.DatabasePath, "counters", 1, [new SqliteCellEdit("value", "8")], TimeSpan.FromMilliseconds(500)))
+            .WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Contains("was stopped", result.Error);
+
+        var stored = await fixture.Client.QueryDatabaseAsync("app.db", "SELECT value FROM counters");
+        Assert.Equal("0", stored.GetProperty("rows")[0][0].GetString());
+    }
+
+    [Fact]
+    public async Task Values_AreWrittenTheSameWayWhateverCultureTheAppRunsIn()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+
+        var original = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("de-DE");
+        try
+        {
+            // "1,5" would come back as TEXT when the grid sent it back, and fail outright in a STRICT table.
+            var result = SqliteBrowser.Query(fixture.DatabasePath, "SELECT 1.5, 0.25, -2", 10);
+
+            Assert.Null(result.Error);
+            Assert.Equal("1.5 | 0.25 | -2", string.Join(" | ", result.Rows[0]));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
+    }
+
+    [Fact]
+    public async Task Authorizer_RefusesLoadExtensionWhilePreparing_EvenWithExtensionLoadingOn()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        using var database = SqliteGateway.Open(fixture.DatabasePath);
+
+        // Turned on deliberately, so the authorizer is the only thing left that can say no. With loading
+        // off, SQLite answers "not authorized" at run time by itself, and an authorizer that checks the
+        // wrong argument still passes a test that only runs the query.
+        Assert.Equal(raw.SQLITE_OK, raw.sqlite3_enable_load_extension(database.Handle, 1));
+
+        var rc = raw.sqlite3_prepare_v2(database.Handle, "SELECT load_extension('evil')", out var statement);
+        var message = raw.sqlite3_errmsg(database.Handle).utf8_to_string();
+        statement?.Dispose();
+
+        // SQLite reports a denied function as a plain error rather than SQLITE_AUTH, so the wording is
+        // what says it was the authorizer. Without one, this statement prepares successfully.
+        Assert.NotEqual(raw.SQLITE_OK, rc);
+        Assert.Contains("not authorized to use function", message);
+    }
+
+    [Fact]
+    public void Agent_ReferencesNothingThatRegistersASqliteProvider()
+    {
+        // Microsoft.Data.Sqlite's connection registers the batteries bundle from its static constructor,
+        // replacing the provider the app set up, and a bundle would bring a provider of the agent's own.
+        var references = AssemblyReferenceGuard.GetReferencedAssemblyNames(typeof(AgentOptions).Assembly.Location);
+        Assert.DoesNotContain(references, x => x.StartsWith("Microsoft.Data.Sqlite", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(references, x => x.StartsWith("SQLitePCLRaw.batteries", StringComparison.OrdinalIgnoreCase));
+
+        var packages = XDocument.Load(Path.Combine(
+                TestRepo.Root, "src", "DevFlow", "Microsoft.Maui.DevFlow.Agent.Abstractions", "Microsoft.Maui.DevFlow.Agent.Abstractions.csproj"))
+            .Descendants("PackageReference")
+            .Select(x => (string?)x.Attribute("Include") ?? "")
+            .ToArray();
+
+        Assert.DoesNotContain(packages, x => x.StartsWith("Microsoft.Data.Sqlite", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(packages, x => x.StartsWith("SQLitePCLRaw.bundle", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>A view that never produces a row: counting upward, forever, for a number below zero.</summary>
+    private const string EndlessView =
+        "CREATE VIEW endless AS WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n WHERE x < 0";
+
     private static string? GetError(JsonElement result)
         => result.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.String
             ? error.GetString()
@@ -331,6 +476,7 @@ public class SqliteBrowserTests
 
         public AgentClient Client { get; }
         public string Root { get; }
+        public string DatabasePath => Path.Combine(Root, "app.db");
 
         public static async Task<Fixture> CreateAsync()
         {

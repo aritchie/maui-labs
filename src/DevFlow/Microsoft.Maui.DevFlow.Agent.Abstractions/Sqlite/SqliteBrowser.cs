@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using Microsoft.Data.Sqlite;
+using System.Globalization;
 using SQLitePCL;
 
 namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
@@ -20,6 +20,12 @@ namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
 /// <see cref="SqliteGateway"/> rather than by anything here.
 /// </para>
 /// <para>
+/// <b>Nothing runs past the deadline.</b> Every operation here - schema, grid, insert, update,
+/// delete, not only the query pane - runs on a connection whose deadline interrupts it. A view is a
+/// query and a trigger is a script, so "just reading a table" or "just changing one cell" can cost
+/// as much as anything typed into the query pane.
+/// </para>
+/// <para>
 /// Nothing in here throws for something the SQL did. A statement that will not parse, names a table
 /// that is not there, or breaks a constraint comes back in the result's error - to the person who
 /// just typed it, those are answers rather than faults.
@@ -28,195 +34,182 @@ namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
 internal static class SqliteBrowser
 {
     /// <summary>
-    /// How long any one statement gets before it is interrupted.
-    /// </summary>
-    /// <remarks>
-    /// This may be a phone. A cartesian join typed by accident is not a hung request to be waited
-    /// out - it is a warm device with a flat battery, holding a write lock on a file the file
-    /// manager is also showing.
-    /// </remarks>
-    private static readonly TimeSpan StatementTimeout = TimeSpan.FromSeconds(30);
-
-    /// <summary>
     /// How much of a blob to describe rather than send. A cell is a table cell; nobody reads a
     /// megabyte of jpeg in one, and shipping it would cost the row it is in.
     /// </summary>
     private const int BlobPreview = 32;
 
+    /// <summary>
+    /// The three names SQLite answers to for a table's rowid, in the order they are tried.
+    /// </summary>
+    private static readonly string[] RowIdAliases = ["rowid", "_rowid_", "oid"];
+
     // ── Schema ──
 
-    public static SqliteSchemaResponse ReadSchema(string fullPath)
+    /// <exception cref="InvalidOperationException">The file could not be read as a database, or the read ran past the deadline.</exception>
+    public static SqliteSchemaResponse ReadSchema(string fullPath, TimeSpan? timeout = null)
     {
-        using var connection = SqliteGateway.Open(fullPath);
-
-        var names = new List<(string Name, string Kind)>();
-
-        // sqlite_master rather than the pragma_table_list of newer SQLite: this has to answer for
-        // whatever version wrote the file, and the two internal prefixes are the whole difference.
-        using (var command = connection.CreateCommand())
+        try
         {
-            command.CommandText =
+            using var database = SqliteGateway.Open(fullPath, timeout);
+
+            var names = new List<(string Name, string Kind)>();
+
+            // sqlite_master rather than the pragma_table_list of newer SQLite: this has to answer for
+            // whatever version wrote the file, and the two internal prefixes are the whole difference.
+            using (var statement = database.Prepare(
                 """
                 SELECT name, type
                 FROM sqlite_master
                 WHERE type IN ('table', 'view')
                   AND name NOT LIKE 'sqlite\_%' ESCAPE '\'
                 ORDER BY type, name COLLATE NOCASE
-                """;
-
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
-                names.Add((reader.GetString(0), reader.GetString(1)));
-        }
-
-        var tables = names
-            .Select(x => new SqliteTableDescriptor
+                """))
             {
-                Name = x.Name,
-                Kind = x.Kind,
-                Columns = ReadColumns(connection, x.Name).Select(Describe).ToArray(),
+                while (statement.Step())
+                    names.Add((statement.GetString(0), statement.GetString(1)));
+            }
 
-                // A view has no indexes and cannot be given any. PRAGMA index_list answers for one
-                // with an empty list rather than an error, so this is skipped for the answer it
-                // would give rather than for the error it would raise.
-                Indexes = x.Kind == "table" ? ReadIndexes(connection, x.Name) : [],
-                HasRowId = HasRowId(connection, x.Name)
-            })
-            .ToArray();
+            var tables = names
+                .Select(x => new SqliteTableDescriptor
+                {
+                    Name = x.Name,
+                    Kind = x.Kind,
+                    Columns = ReadColumns(database, x.Name).Select(Describe).ToArray(),
 
-        return new SqliteSchemaResponse
+                    // A view has no indexes and cannot be given any. PRAGMA index_list answers for one
+                    // with an empty list rather than an error, so this is skipped for the answer it
+                    // would give rather than for the error it would raise.
+                    Indexes = x.Kind == "table" ? ReadIndexes(database, x.Name) : [],
+                    HasRowId = RowIdAlias(database, x.Name) is not null
+                })
+                .ToArray();
+
+            return new SqliteSchemaResponse
+            {
+                Tables = tables,
+                FileSize = new FileInfo(fullPath).Length,
+                SqliteVersion = SqliteDatabase.Version
+            };
+        }
+        catch (OperationCanceledException)
         {
-            Tables = tables,
-            FileSize = new FileInfo(fullPath).Length,
-            SqliteVersion = connection.ServerVersion
-        };
+            throw new InvalidOperationException(TimedOut(timeout));
+        }
+        catch (SqliteError ex)
+        {
+            throw new InvalidOperationException(ex.Message, ex);
+        }
     }
 
     // ── Query ──
 
-    public static SqliteQueryResponse Query(string fullPath, string sql, int maxRows)
+    public static SqliteQueryResponse Query(string fullPath, string sql, int maxRows, TimeSpan? timeout = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var connection = SqliteGateway.Open(fullPath);
-            return Execute(connection, sql, maxRows, watch);
+            using var database = SqliteGateway.Open(fullPath, timeout);
+            return RunScript(database, sql, maxRows, watch);
         }
-        catch (OperationCanceledException)
+        catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, TimedOut());
-        }
-        catch (SqliteException ex)
-        {
-            return Failed(watch, ex.Message);
-        }
-        catch (InvalidOperationException ex)
-        {
-            // what Open throws when the bytes are not a database
-            return Failed(watch, ex.Message);
+            return Failed(watch, Describe(ex, timeout));
         }
     }
 
-    private static SqliteQueryResponse Execute(SqliteConnection connection, string sql, int maxRows, Stopwatch watch)
+    private static SqliteQueryResponse RunScript(SqliteDatabase database, string sql, int maxRows, Stopwatch watch)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = sql;
-
-        // sqlite3_interrupt, reached through the raw provider rather than through
-        // SqliteCommand.Cancel - which is an empty method on this provider. A command that silently
-        // does nothing when asked to stop is the difference between a timeout and a flat battery.
-        var handle = connection.Handle;
-        using var deadline = new CancellationTokenSource(StatementTimeout);
-        using var registration = deadline.Token.Register(() => raw.sqlite3_interrupt(handle));
-
-        using var reader = Interruptible(() => command.ExecuteReader());
-
         var columns = Array.Empty<string>();
         var rows = new List<string?[]>();
         var truncated = false;
+        var shown = false;
 
-        // ExecuteReader stops at the first statement that produces rows, so a script ending in a
-        // SELECT arrives here already positioned on it. Walking result sets is what makes
-        // "UPDATE …; SELECT * FROM …" - which is how anyone checks their own write - do what it
-        // looks like.
-        do
+        // -1 until a statement that can write has run: "0 rows affected" is a true and useful thing for
+        // a DELETE to say, and "not that kind of statement" is not the same answer.
+        var affected = -1;
+
+        // Every statement runs, in order. The first that produces columns is the one shown - which is
+        // what makes "UPDATE …; SELECT * FROM …", how anyone checks their own write, do what it looks
+        // like - and everything after it still runs: a trailing UPDATE that was never stepped is a write
+        // the user watched succeed and did not get.
+        var remaining = sql;
+        while (database.PrepareNext(ref remaining) is { } statement)
         {
-            if (reader.FieldCount == 0)
-                continue;
-
-            columns = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToArray();
-
-            while (Interruptible(reader.Read))
+            using (statement)
             {
-                if (rows.Count == maxRows)
+                var changesBefore = database.TotalChanges;
+
+                if (!shown && statement.ColumnCount > 0)
                 {
-                    // Asked for, not read: there is one more row than the cap, which is what lets
-                    // the client say "first 500 of more" rather than "500".
-                    truncated = true;
-                    break;
+                    shown = true;
+                    columns = Enumerable.Range(0, statement.ColumnCount).Select(statement.ColumnName).ToArray();
+
+                    while (statement.Step())
+                    {
+                        if (rows.Count == maxRows)
+                        {
+                            // Asked for, not read: there is one more row than the cap, which is what lets
+                            // the client say "first 500 of more" rather than "500".
+                            truncated = true;
+                            break;
+                        }
+
+                        rows.Add(ReadRow(statement));
+                    }
+                }
+                else
+                {
+                    while (statement.Step())
+                    {
+                    }
                 }
 
-                rows.Add(ReadRow(reader));
+                if (!statement.IsReadOnly)
+                {
+                    // Changes reports the last INSERT, UPDATE or DELETE on the connection even after a
+                    // CREATE TABLE that changed no rows at all, so it is only counted when the total moved.
+                    affected = Math.Max(affected, 0)
+                        + (database.TotalChanges != changesBefore ? database.Changes : 0);
+                }
             }
-
-            break;
-        }
-        while (Interruptible(reader.NextResult));
-
-        // Everything after the result set that was shown still has to run - the reader is lazy, and
-        // a trailing UPDATE that was never stepped is a write the user watched succeed and did not
-        // get. Draining is also what settles RecordsAffected.
-        while (Interruptible(reader.NextResult))
-        {
         }
 
-        reader.Close();
-
-        // A query reports -1 rather than 0, because "0 rows affected" is a true and useful thing for
-        // a DELETE to say, and "not that kind of statement" is not the same answer.
-        var affected = columns.Length > 0 ? -1 : reader.RecordsAffected;
-
-        return Result(columns, rows.ToArray(), affected, truncated, watch, null);
+        return Result(columns, rows.ToArray(), shown ? -1 : affected, truncated, watch, null);
     }
 
     // ── Rows ──
 
-    public static SqliteRowsResponse ReadRows(string fullPath, string table, int maxRows)
+    public static SqliteRowsResponse ReadRows(string fullPath, string table, int maxRows, TimeSpan? timeout = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var connection = SqliteGateway.Open(fullPath);
+            using var database = SqliteGateway.Open(fullPath, timeout);
 
             // A view is selectable but not editable, and this route feeds the grid in both cases -
             // so it takes either, and the absence of rowids in the answer is what tells the client
             // which it got.
-            var name = RequireSelectable(connection, table);
-            var addressable = HasRowId(connection, name);
+            var name = RequireSelectable(database, table);
+            var alias = RowIdAlias(database, name);
 
-            using var command = connection.CreateCommand();
+            // The rowid first and by itself, rather than folded into the * that follows it, under a
+            // name no column of the table has taken - see RowIdAlias.
+            using var statement = database.Prepare(alias is null
+                ? $"SELECT * FROM {Quote(name)} LIMIT $take"
+                : $"SELECT {alias}, * FROM {Quote(name)} LIMIT $take");
 
-            // rowid first and by itself, rather than folded into the * that follows it. A table is
-            // allowed a column of its own called "rowid", and then the select list has two columns
-            // by that name and the ordinal is the only thing that still tells them apart - which is
-            // why this reads column zero by position and never by name.
-            command.CommandText = addressable
-                ? $"SELECT rowid, * FROM {Quote(name)} LIMIT $take"
-                : $"SELECT * FROM {Quote(name)} LIMIT $take";
+            statement.Bind("$take", maxRows + 1L);
 
-            command.Parameters.AddWithValue("$take", maxRows + 1);
-
-            using var reader = command.ExecuteReader();
-
-            var offset = addressable ? 1 : 0;
-            var columns = Enumerable.Range(offset, reader.FieldCount - offset).Select(reader.GetName).ToArray();
+            var offset = alias is null ? 0 : 1;
+            var columns = Enumerable.Range(offset, statement.ColumnCount - offset).Select(statement.ColumnName).ToArray();
             var ids = new List<long>();
             var rows = new List<string?[]>();
             var truncated = false;
 
-            while (reader.Read())
+            while (statement.Step())
             {
                 if (rows.Count == maxRows)
                 {
@@ -224,13 +217,11 @@ internal static class SqliteBrowser
                     break;
                 }
 
-                if (addressable)
-                    ids.Add(reader.GetInt64(0));
+                if (alias is not null)
+                    ids.Add(statement.GetInt64(0));
 
-                rows.Add(ReadRow(reader, offset));
+                rows.Add(ReadRow(statement, offset));
             }
-
-            reader.Close();
 
             return new SqliteRowsResponse
             {
@@ -242,73 +233,74 @@ internal static class SqliteBrowser
                 Error = null
             };
         }
-        catch (Exception ex) when (ex is SqliteException or InvalidOperationException or OperationCanceledException)
+        catch (Exception ex) when (IsAnswer(ex))
         {
             return new SqliteRowsResponse
             {
                 ElapsedMs = watch.ElapsedMilliseconds,
-                Error = Describe(ex)
+                Error = Describe(ex, timeout)
             };
         }
     }
 
-    public static SqliteQueryResponse InsertRow(string fullPath, string table, IReadOnlyList<SqliteCellEdit> values)
+    public static SqliteQueryResponse InsertRow(string fullPath, string table, IReadOnlyList<SqliteCellEdit> values, TimeSpan? timeout = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var connection = SqliteGateway.Open(fullPath);
+            using var database = SqliteGateway.Open(fullPath, timeout);
 
             // The table and every column name are taken from the database's own schema rather than
             // from the request, because an identifier cannot be a parameter and the only safe
             // identifier is one the caller never chose.
-            var name = RequireTable(connection, table);
-            var columns = ReadColumns(connection, name);
-
-            using var command = connection.CreateCommand();
+            var name = RequireTable(database, table);
+            var columns = ReadColumns(database, name);
 
             var quoted = new List<string>();
-            var parameters = new List<string>();
+            var parameters = new List<(string Name, string? Value)>();
 
             for (var i = 0; i < values.Count; i++)
             {
-                var value = values[i];
-                var column = FindColumn(columns, name, value.Column);
-
-                var parameter = $"$v{i}";
+                var column = FindColumn(columns, name, values[i].Column);
                 quoted.Add(Quote(column));
-                parameters.Add(parameter);
-
-                command.Parameters.AddWithValue(parameter, (object?)value.Value ?? DBNull.Value);
+                parameters.Add(($"$v{i}", values[i].Value));
             }
 
             // DEFAULT VALUES rather than an empty column list, which is not valid SQL. It is the
             // honest statement for "one more record, all of it whatever the table says".
-            command.CommandText = quoted.Count == 0
+            using (var statement = database.Prepare(quoted.Count == 0
                 ? $"INSERT INTO {Quote(name)} DEFAULT VALUES"
-                : $"INSERT INTO {Quote(name)} ({string.Join(", ", quoted)}) VALUES ({string.Join(", ", parameters)})";
+                : $"INSERT INTO {Quote(name)} ({string.Join(", ", quoted)}) VALUES ({string.Join(", ", parameters.Select(x => x.Name))})"))
+            {
+                foreach (var (parameter, value) in parameters)
+                    statement.Bind(parameter, value);
 
-            var affected = command.ExecuteNonQuery();
+                while (statement.Step())
+                {
+                }
+            }
+
+            var affected = database.Changes;
 
             // Where the record landed, asked of the connection rather than worked out: the value is
             // the rowid of the last insert on this connection, and this connection has done exactly
             // one thing. It is also the only way to find a record whose key the table chose.
-            var rowId = raw.sqlite3_last_insert_rowid(connection.Handle);
+            var rowId = database.LastInsertRowId;
 
-            // A WITHOUT ROWID table has nothing to read back by - the insert worked, and there is no
-            // id that names what it wrote. The count is the whole answer, and the grid re-reads.
-            return HasRowId(connection, name)
-                ? ReadBack(connection, name, rowId, affected, watch)
+            // A table with no rowid to name has nothing to read back by - the insert worked, and there
+            // is no id that names what it wrote. The count is the whole answer, and the grid re-reads.
+            return RowIdAlias(database, name) is { } alias
+                ? ReadBack(database, name, alias, rowId, affected, watch)
                 : Result([], [], affected, false, watch, null);
         }
-        catch (Exception ex) when (ex is SqliteException or InvalidOperationException or OperationCanceledException)
+        catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex));
+            return Failed(watch, Describe(ex, timeout));
         }
     }
 
-    public static SqliteQueryResponse UpdateRow(string fullPath, string table, long rowId, IReadOnlyList<SqliteCellEdit> changes)
+    public static SqliteQueryResponse UpdateRow(string fullPath, string table, long rowId, IReadOnlyList<SqliteCellEdit> changes, TimeSpan? timeout = null)
     {
         var watch = Stopwatch.StartNew();
 
@@ -317,33 +309,39 @@ internal static class SqliteBrowser
 
         try
         {
-            using var connection = SqliteGateway.Open(fullPath);
+            using var database = SqliteGateway.Open(fullPath, timeout);
 
-            var name = RequireTable(connection, table);
-            var columns = ReadColumns(connection, name);
+            var name = RequireTable(database, table);
+            var columns = ReadColumns(database, name);
+            var alias = RequireRowIdAlias(database, name);
 
             var assignments = new List<string>();
-            using var command = connection.CreateCommand();
+            var parameters = new List<(string Name, string? Value)>();
 
             for (var i = 0; i < changes.Count; i++)
             {
-                var change = changes[i];
-                var column = FindColumn(columns, name, change.Column);
+                var column = FindColumn(columns, name, changes[i].Column);
+                assignments.Add($"{Quote(column)} = $v{i}");
+                parameters.Add(($"$v{i}", changes[i].Value));
+            }
 
-                var parameter = $"$v{i}";
-                assignments.Add($"{Quote(column)} = {parameter}");
-
+            using (var statement = database.Prepare(
+                $"UPDATE {Quote(name)} SET {string.Join(", ", assignments)} WHERE {alias} = $rowid"))
+            {
                 // The text goes in as text and SQLite applies the column's affinity to it, so "42"
                 // typed into an INTEGER column is stored as the number 42 - which is why the row is
                 // read back below rather than assumed.
-                command.Parameters.AddWithValue(parameter, (object?)change.Value ?? DBNull.Value);
+                foreach (var (parameter, value) in parameters)
+                    statement.Bind(parameter, value);
+
+                statement.Bind("$rowid", rowId);
+
+                while (statement.Step())
+                {
+                }
             }
 
-            command.CommandText =
-                $"UPDATE {Quote(name)} SET {string.Join(", ", assignments)} WHERE rowid = $rowid";
-            command.Parameters.AddWithValue("$rowid", rowId);
-
-            var affected = command.ExecuteNonQuery();
+            var affected = database.Changes;
 
             if (affected == 0)
             {
@@ -352,36 +350,42 @@ internal static class SqliteBrowser
                 return Failed(watch, "That record is no longer there. Refresh the table.");
             }
 
-            return ReadBack(connection, name, rowId, affected, watch);
+            return ReadBack(database, name, alias, rowId, affected, watch);
         }
-        catch (Exception ex) when (ex is SqliteException or InvalidOperationException or OperationCanceledException)
+        catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex));
+            return Failed(watch, Describe(ex, timeout));
         }
     }
 
-    public static SqliteQueryResponse DeleteRow(string fullPath, string table, long rowId)
+    public static SqliteQueryResponse DeleteRow(string fullPath, string table, long rowId, TimeSpan? timeout = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var connection = SqliteGateway.Open(fullPath);
-            var name = RequireTable(connection, table);
+            using var database = SqliteGateway.Open(fullPath, timeout);
+            var name = RequireTable(database, table);
+            var alias = RequireRowIdAlias(database, name);
 
-            using var command = connection.CreateCommand();
-            command.CommandText = $"DELETE FROM {Quote(name)} WHERE rowid = $rowid";
-            command.Parameters.AddWithValue("$rowid", rowId);
+            using (var statement = database.Prepare($"DELETE FROM {Quote(name)} WHERE {alias} = $rowid"))
+            {
+                statement.Bind("$rowid", rowId);
 
-            var affected = command.ExecuteNonQuery();
+                while (statement.Step())
+                {
+                }
+            }
+
+            var affected = database.Changes;
 
             return affected == 0
                 ? Failed(watch, "That record is no longer there. Refresh the table.")
                 : Result([], [], affected, false, watch, null);
         }
-        catch (Exception ex) when (ex is SqliteException or InvalidOperationException or OperationCanceledException)
+        catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex));
+            return Failed(watch, Describe(ex, timeout));
         }
     }
 
@@ -390,18 +394,13 @@ internal static class SqliteBrowser
     /// type affinity, a column left out takes its default, an INTEGER PRIMARY KEY takes the next
     /// rowid, and a trigger is free to have made it something else again.
     /// </summary>
-    private static SqliteQueryResponse ReadBack(SqliteConnection connection, string table, long rowId, int affected, Stopwatch watch)
+    private static SqliteQueryResponse ReadBack(SqliteDatabase database, string table, string alias, long rowId, int affected, Stopwatch watch)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT * FROM {Quote(table)} WHERE rowid = $rowid";
-        command.Parameters.AddWithValue("$rowid", rowId);
+        using var statement = database.Prepare($"SELECT * FROM {Quote(table)} WHERE {alias} = $rowid");
+        statement.Bind("$rowid", rowId);
 
-        using var reader = command.ExecuteReader();
-
-        var columns = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToArray();
-        var rows = reader.Read() ? new[] { ReadRow(reader) } : [];
-
-        reader.Close();
+        var columns = Enumerable.Range(0, statement.ColumnCount).Select(statement.ColumnName).ToArray();
+        var rows = statement.Step() ? new[] { ReadRow(statement) } : [];
 
         return Result(columns, rows, affected, false, watch, null);
     }
@@ -412,20 +411,25 @@ internal static class SqliteBrowser
     /// The first column to read. Non-zero for the editable grid, whose select list carries the rowid
     /// in front of the table's own columns.
     /// </param>
-    private static string?[] ReadRow(SqliteDataReader reader, int from = 0)
+    private static string?[] ReadRow(SqliteStatement statement, int from = 0)
     {
-        var values = new string?[reader.FieldCount - from];
+        var values = new string?[statement.ColumnCount - from];
 
         for (var i = 0; i < values.Length; i++)
         {
             var ordinal = i + from;
 
-            if (reader.IsDBNull(ordinal))
-                continue;
-
-            values[i] = reader.GetFieldType(ordinal) == typeof(byte[])
-                ? DescribeBlob(reader, ordinal)
-                : reader.GetValue(ordinal).ToString();
+            // Numbers in the invariant culture, and a REAL in its round-trip form. The text is what the
+            // grid shows and what an edit sends back: "1,5" from a German phone is TEXT when it returns,
+            // and an error in a STRICT table.
+            values[i] = statement.ColumnType(ordinal) switch
+            {
+                raw.SQLITE_NULL => null,
+                raw.SQLITE_INTEGER => statement.GetInt64(ordinal).ToString(CultureInfo.InvariantCulture),
+                raw.SQLITE_FLOAT => statement.GetDouble(ordinal).ToString("R", CultureInfo.InvariantCulture),
+                raw.SQLITE_BLOB => DescribeBlob(statement.GetBlob(ordinal)),
+                _ => statement.GetString(ordinal)
+            };
         }
 
         return values;
@@ -435,38 +439,31 @@ internal static class SqliteBrowser
     /// A blob as a length and a few bytes of hex, because a cell cannot show one and a row should
     /// not cost what one weighs. Enough is shown to recognise a PNG header or a UUID.
     /// </summary>
-    private static string DescribeBlob(SqliteDataReader reader, int ordinal)
+    private static string DescribeBlob(ReadOnlySpan<byte> blob)
     {
-        var length = reader.GetBytes(ordinal, 0, null, 0, 0);
-        var take = (int)Math.Min(length, BlobPreview);
-        var buffer = new byte[take];
-        reader.GetBytes(ordinal, 0, buffer, 0, take);
+        var take = Math.Min(blob.Length, BlobPreview);
+        var hex = Convert.ToHexString(blob[..take]);
+        var ellipsis = blob.Length > take ? "…" : "";
 
-        var hex = Convert.ToHexString(buffer);
-        var ellipsis = length > take ? "…" : "";
-
-        return $"BLOB[{length}] {hex}{ellipsis}";
+        return $"BLOB[{blob.Length}] {hex}{ellipsis}";
     }
 
     // ── Schema helpers ──
 
-    private static List<SqliteColumn> ReadColumns(SqliteConnection connection, string table)
+    private static List<SqliteColumn> ReadColumns(SqliteDatabase database, string table)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA table_info({Quote(table)})";
-
-        using var reader = command.ExecuteReader();
+        using var statement = database.Prepare($"PRAGMA table_info({Quote(table)})");
         var columns = new List<SqliteColumn>();
 
-        while (reader.Read())
+        while (statement.Step())
         {
             columns.Add(new SqliteColumn(
-                reader.GetString(1),
+                statement.GetString(1),
                 // A column in a view, or in a table declared without types, has none - and "" reads
                 // as a missing value in the header rather than as the answer it is.
-                reader.IsDBNull(2) || reader.GetString(2).Length == 0 ? "any" : reader.GetString(2),
-                reader.GetBoolean(3),
-                reader.GetInt32(5) > 0
+                statement.IsNull(2) || statement.GetString(2).Length == 0 ? "any" : statement.GetString(2),
+                statement.GetBoolean(3),
+                statement.GetInt32(5) > 0
             ));
         }
 
@@ -479,27 +476,23 @@ internal static class SqliteBrowser
     /// <remarks>
     /// Two pragmas rather than a join on <c>sqlite_master</c>: the SQL of an index is null for the
     /// ones SQLite made itself, and <c>index_list</c> is the only thing that answers for unique,
-    /// partial and automatic in one place. Read into a list before the second pragma runs - a pragma
-    /// is a statement like any other, and this provider allows only one reader per connection.
+    /// partial and automatic in one place.
     /// </remarks>
-    private static SqliteIndexDescriptor[] ReadIndexes(SqliteConnection connection, string table)
+    private static SqliteIndexDescriptor[] ReadIndexes(SqliteDatabase database, string table)
     {
         var found = new List<(string Name, bool Unique, bool Automatic, bool Partial)>();
 
-        using (var command = connection.CreateCommand())
+        using (var statement = database.Prepare($"PRAGMA index_list({Quote(table)})"))
         {
-            command.CommandText = $"PRAGMA index_list({Quote(table)})";
-
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
+            while (statement.Step())
             {
                 // seq, name, unique, origin, partial - origin is "c" for a CREATE INDEX and "u" or
                 // "pk" for the index a UNIQUE or PRIMARY KEY constraint brought with it.
                 found.Add((
-                    reader.GetString(1),
-                    reader.GetBoolean(2),
-                    !string.Equals(reader.GetString(3), "c", StringComparison.Ordinal),
-                    reader.GetBoolean(4)
+                    statement.GetString(1),
+                    statement.GetBoolean(2),
+                    !string.Equals(statement.GetString(3), "c", StringComparison.Ordinal),
+                    statement.GetBoolean(4)
                 ));
             }
         }
@@ -508,7 +501,7 @@ internal static class SqliteBrowser
             .Select(x => new SqliteIndexDescriptor
             {
                 Name = x.Name,
-                Columns = ReadIndexColumns(connection, x.Name),
+                Columns = ReadIndexColumns(database, x.Name),
                 Unique = x.Unique,
                 Automatic = x.Automatic,
                 Partial = x.Partial
@@ -516,46 +509,64 @@ internal static class SqliteBrowser
             .ToArray();
     }
 
-    private static string[] ReadIndexColumns(SqliteConnection connection, string index)
+    private static string[] ReadIndexColumns(SqliteDatabase database, string index)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA index_info({Quote(index)})";
-
-        using var reader = command.ExecuteReader();
+        using var statement = database.Prepare($"PRAGMA index_info({Quote(index)})");
         var columns = new List<string>();
 
-        while (reader.Read())
+        while (statement.Step())
         {
             // seqno, cid, name - the name is null where the index is over an expression rather than
             // a column, which is a position in the index that has to be accounted for.
-            columns.Add(reader.IsDBNull(2) ? "(expression)" : reader.GetString(2));
+            columns.Add(statement.IsNull(2) ? "(expression)" : statement.GetString(2));
         }
 
         return columns.ToArray();
     }
 
     /// <summary>
-    /// Whether rows in this table can be named individually.
+    /// The name that reaches this table's real rowid, or null when nothing does: a view, a WITHOUT
+    /// ROWID table, or a table whose own columns have taken every name the rowid answers to.
     /// </summary>
     /// <remarks>
-    /// Asked by preparing a statement rather than by reading the schema: a WITHOUT ROWID table and a
-    /// view both fail to compile <c>SELECT rowid</c>, and there is no single flag covering both.
-    /// <c>LIMIT 0</c> so this costs a prepare and never a scan.
+    /// <para>
+    /// A table may declare a column called <c>rowid</c>, and from then on <c>rowid</c> in a statement
+    /// means that column - which need not be unique, so an UPDATE naming one record by it can change
+    /// several. SQLite answers to three names for the real rowid and a column can shadow each one, so
+    /// the first that no column has claimed is the one used, and a table that has claimed all three
+    /// is read-only here.
+    /// </para>
+    /// <para>
+    /// Whether there is a rowid at all is asked by preparing a statement rather than by reading the
+    /// schema: a view and a WITHOUT ROWID table both fail to compile one, and there is no single flag
+    /// covering both. Prepared and never stepped, so this never costs a scan.
+    /// </para>
     /// </remarks>
-    private static bool HasRowId(SqliteConnection connection, string table)
+    private static string? RowIdAlias(SqliteDatabase database, string table)
     {
+        var taken = ReadColumns(database, table)
+            .Select(x => x.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var alias = RowIdAliases.FirstOrDefault(x => !taken.Contains(x));
+        if (alias is null)
+            return null;
+
         try
         {
-            using var command = connection.CreateCommand();
-            command.CommandText = $"SELECT rowid FROM {Quote(table)} LIMIT 0";
-            command.ExecuteNonQuery();
-            return true;
+            using var _ = database.Prepare($"SELECT {alias} FROM {Quote(table)} LIMIT 0");
+            return alias;
         }
-        catch (SqliteException)
+        catch (SqliteError)
         {
-            return false;
+            return null;
         }
     }
+
+    private static string RequireRowIdAlias(SqliteDatabase database, string table)
+        => RowIdAlias(database, table)
+            ?? throw new InvalidOperationException(
+                $"'{table}' has no rowid to name a record by, so its records cannot be edited here. Use the query pane.");
 
     /// <summary>
     /// The name of a real table, as the database spells it, or an error naming what was asked for.
@@ -566,13 +577,13 @@ internal static class SqliteBrowser
     /// tables, because this is the check a write goes through: a view has no rowid, so there is no
     /// record for an UPDATE to name.
     /// </remarks>
-    private static string RequireTable(SqliteConnection connection, string requested)
-        => Find(connection, requested, "type = 'table'")
+    private static string RequireTable(SqliteDatabase database, string requested)
+        => Find(database, requested, "type = 'table'")
             ?? throw new InvalidOperationException($"There is no table called '{requested}'.");
 
     /// <summary>The same, for reading, where a view is a perfectly good thing to be pointed at.</summary>
-    private static string RequireSelectable(SqliteConnection connection, string requested)
-        => Find(connection, requested, "type IN ('table', 'view')")
+    private static string RequireSelectable(SqliteDatabase database, string requested)
+        => Find(database, requested, "type IN ('table', 'view')")
             ?? throw new InvalidOperationException($"There is nothing called '{requested}' in this database.");
 
     /// <summary>
@@ -588,13 +599,12 @@ internal static class SqliteBrowser
     /// No ambiguity to worry about: SQLite refuses to create two tables whose names differ only by
     /// case, so at most one row can match.
     /// </remarks>
-    private static string? Find(SqliteConnection connection, string requested, string kinds)
+    private static string? Find(SqliteDatabase database, string requested, string kinds)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT name FROM sqlite_master WHERE {kinds} AND name = $name COLLATE NOCASE";
-        command.Parameters.AddWithValue("$name", requested);
+        using var statement = database.Prepare($"SELECT name FROM sqlite_master WHERE {kinds} AND name = $name COLLATE NOCASE");
+        statement.Bind("$name", requested);
 
-        return command.ExecuteScalar() as string;
+        return statement.Step() ? statement.GetString(0) : null;
     }
 
     /// <summary>
@@ -626,23 +636,18 @@ internal static class SqliteBrowser
     private static SqliteQueryResponse Failed(Stopwatch watch, string message)
         => Result([], [], -1, false, watch, message);
 
-    private static string TimedOut()
-        => $"The statement was still running after {StatementTimeout.TotalSeconds:0} seconds and was stopped.";
+    /// <summary>
+    /// What a request can fail with that is an answer for the person asking: SQL that SQLite refused,
+    /// a file that is not a database, a name that is not there, or the deadline.
+    /// </summary>
+    private static bool IsAnswer(Exception ex)
+        => ex is SqliteError or InvalidOperationException or OperationCanceledException;
 
-    private static string Describe(Exception ex)
-        => ex is OperationCanceledException ? TimedOut() : ex.Message;
+    private static string TimedOut(TimeSpan? timeout)
+        => $"The statement was still running after {(timeout ?? SqliteGateway.DefaultTimeout).TotalSeconds:0.#} seconds and was stopped.";
 
-    private static T Interruptible<T>(Func<T> step)
-    {
-        try
-        {
-            return step();
-        }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == raw.SQLITE_INTERRUPT)
-        {
-            throw new OperationCanceledException();
-        }
-    }
+    private static string Describe(Exception ex, TimeSpan? timeout)
+        => ex is OperationCanceledException ? TimedOut(timeout) : ex.Message;
 
     /// <summary>
     /// An identifier, quoted. Every name that reaches this came out of <c>sqlite_master</c> or

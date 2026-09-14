@@ -1,4 +1,3 @@
-using Microsoft.Data.Sqlite;
 using SQLitePCL;
 
 namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
@@ -21,101 +20,133 @@ namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
 /// </remarks>
 internal static class SqliteGateway
 {
-    private static readonly object ProviderGate = new();
-    private static bool _providerChecked;
-
     /// <summary>
-    /// Registers a SQLite provider, but only if the host app has not already registered one.
+    /// How long one request gets on a connection before whatever it is running is interrupted.
     /// </summary>
     /// <remarks>
-    /// This is why the package reference is <c>Microsoft.Data.Sqlite.Core</c> and not
-    /// <c>Microsoft.Data.Sqlite</c>. The full package initialises a bundle from a static constructor,
-    /// which would replace whatever provider the app under test set up - a debugging tool quietly
-    /// changing how the app talks to its own database is not a trade worth making for convenience.
+    /// This may be a phone. A cartesian join typed by accident is not a hung request to be waited
+    /// out - it is a warm device with a flat battery, holding a write lock on a file the file
+    /// manager is also showing.
     /// </remarks>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
+
+    private static readonly object ProviderGate = new();
+    private static volatile bool _providerReady;
+
+    /// <summary>
+    /// Makes sure a SQLite provider is registered, without ever replacing one that is.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The agent references SQLitePCLRaw's core and nothing else: no bundle, so it brings no provider
+    /// of its own to compete with the app's, and not Microsoft.Data.Sqlite, whose connection registers
+    /// the batteries bundle from a static constructor whether or not the app already chose one. The
+    /// app's provider - e_sqlite3, sqlcipher, the system library - is the one every database here is
+    /// opened with.
+    /// </para>
+    /// <para>
+    /// When nothing is registered yet there is nothing to replace, so the app's own batteries bundle is
+    /// initialised if it ships one - the same thing the app's first connection would do. With no
+    /// bundle at all the app has no SQLite to browse, and that is the error.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The app has no SQLite provider.</exception>
     public static void EnsureProvider()
     {
-        if (_providerChecked)
+        if (_providerReady)
             return;
 
         lock (ProviderGate)
         {
-            if (_providerChecked)
+            if (_providerReady)
                 return;
 
-            try
+            if (!HasProvider())
             {
-                // Any call into the provider throws when none is registered. A version string coming
-                // back means the app already did this, and we leave its choice alone.
-                _ = raw.sqlite3_libversion();
-            }
-            catch (Exception)
-            {
-                Batteries_V2.Init();
+                RegisterAppBundle();
+
+                // Not remembered: an app that registers its provider later should not be told no forever.
+                if (!HasProvider())
+                    throw new InvalidOperationException("This app has no SQLite provider registered, so there is no SQLite to open its databases with.");
             }
 
-            _providerChecked = true;
+            _providerReady = true;
+        }
+    }
+
+    private static bool HasProvider()
+    {
+        try
+        {
+            // Any call into the provider throws when none is registered.
+            _ = raw.sqlite3_libversion_number();
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static void RegisterAppBundle()
+    {
+        try
+        {
+            Type.GetType("SQLitePCL.Batteries_V2, SQLitePCLRaw.batteries_v2")
+                ?.GetMethod("Init", Type.EmptyTypes)
+                ?.Invoke(null, null);
+        }
+        catch (Exception)
+        {
+            // A bundle that will not load leaves no provider, which the caller reports.
         }
     }
 
     /// <summary>
     /// Opens a database, with the authorizer installed before anything can be prepared on it.
     /// </summary>
+    /// <param name="timeout">The deadline for everything run on the connection. <see cref="DefaultTimeout"/> when null.</param>
     /// <exception cref="InvalidOperationException">
     /// The file is not a SQLite database - a perfectly ordinary thing for a file called <c>.db</c>
     /// to turn out not to be - or SQLite refused to open it.
     /// </exception>
-    public static SqliteConnection Open(string fullPath)
+    public static SqliteDatabase Open(string fullPath, TimeSpan? timeout = null)
     {
         EnsureProvider();
 
-        var connection = new SqliteConnection(new SqliteConnectionStringBuilder
-        {
-            DataSource = fullPath,
-
-            // ReadWrite and not ReadWriteCreate: a typo in a path should be an error, not a new
-            // empty database appearing in the directory the file manager is showing.
-            Mode = SqliteOpenMode.ReadWrite,
-
-            // Pooling keeps the handle - and on a write, the lock - alive after this connection is
-            // disposed, which would leave the file manager unable to rename or delete a database
-            // anyone had so much as looked at. One connection per request, closed with the request.
-            Pooling = false
-        }.ToString());
+        // ReadWrite and not create: a typo in a path should be an error, not a new empty database
+        // appearing in the directory the file manager is showing. And one connection per request,
+        // closed with the request, so no pooled handle keeps a lock the file manager then trips over.
+        var database = SqliteDatabase.Open(fullPath, raw.SQLITE_OPEN_READWRITE, timeout ?? DefaultTimeout);
 
         try
         {
-            connection.Open();
-            Restrict(connection);
+            Restrict(database.Handle);
 
             // Open does not touch the file. SQLite reads page one when the first statement is
             // prepared, so a text file with a .db on it opens perfectly happily and only falls over
             // later - inside a schema read or somebody's query, where the failure arrives as
             // SQLite's own wording instead of a sentence about the file being the wrong sort of
             // thing. This is the cheapest statement that forces the header to be read.
-            using (var probe = connection.CreateCommand())
-            {
-                probe.CommandText = "PRAGMA schema_version";
-                probe.ExecuteScalar();
-            }
+            database.Execute("PRAGMA schema_version");
         }
-        catch (SqliteException ex)
+        catch (SqliteError ex)
         {
-            connection.Dispose();
+            database.Dispose();
 
             // SQLITE_NOTADB is what a .db that is really a thumbnail cache or a renamed zip comes
             // back as, and it is the single most likely failure here - the extension is a guess.
-            throw ex.SqliteErrorCode == 26
+            throw ex.Code == raw.SQLITE_NOTADB
                 ? new InvalidOperationException($"'{Path.GetFileName(fullPath)}' is not a SQLite database.")
                 : new InvalidOperationException(ex.Message, ex);
         }
         catch
         {
-            connection.Dispose();
+            database.Dispose();
             throw;
         }
 
-        return connection;
+        return database;
     }
 
     /// <summary>
@@ -135,14 +166,17 @@ internal static class SqliteGateway
     /// app - not a database operation at any setting.
     /// </para>
     /// </remarks>
-    private static void Restrict(SqliteConnection connection)
+    private static void Restrict(sqlite3 handle)
     {
         var result = raw.sqlite3_set_authorizer(
-            connection.Handle,
-            (_, action, argument, _, _, _) => action switch
+            handle,
+            // For SQLITE_FUNCTION the first string is always null and the function's name is the
+            // second - checking the first matches nothing, and leaves only the app's extension-loading
+            // setting between a query and a shared library.
+            (_, action, _, function, _, _) => action switch
             {
                 raw.SQLITE_ATTACH => raw.SQLITE_DENY,
-                raw.SQLITE_FUNCTION when IsExtensionLoader(argument.utf8_to_string()) => raw.SQLITE_DENY,
+                raw.SQLITE_FUNCTION when IsExtensionLoader(function) => raw.SQLITE_DENY,
                 _ => raw.SQLITE_OK
             },
             null
@@ -167,19 +201,11 @@ internal static class SqliteGateway
     {
         EnsureProvider();
 
-        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
-        {
-            DataSource = fullPath,
-            Mode = SqliteOpenMode.ReadWriteCreate,
-            Pooling = false
-        }.ToString());
-
-        connection.Open();
+        using var database = SqliteDatabase.Open(
+            fullPath, raw.SQLITE_OPEN_READWRITE | raw.SQLITE_OPEN_CREATE, DefaultTimeout);
 
         // Opening alone leaves a zero-byte file: SQLite writes page one when it first has something
         // to put in it. A pragma that changes a setting is the cheapest thing that counts as that.
-        using var command = connection.CreateCommand();
-        command.CommandText = "PRAGMA user_version = 0";
-        command.ExecuteNonQuery();
+        database.Execute("PRAGMA user_version = 0");
     }
 }

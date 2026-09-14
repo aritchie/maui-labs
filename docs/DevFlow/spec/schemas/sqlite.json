@@ -82,7 +82,7 @@
         },
         "hasRowId": {
           "type": "boolean",
-          "description": "Whether a row can be named for editing. False for views and WITHOUT ROWID tables."
+          "description": "Whether a row can be named for editing. False for views, WITHOUT ROWID tables, and tables whose own columns are called rowid, _rowid_ and oid - each of which hides the real rowid by that name."
         }
       },
       "required": [

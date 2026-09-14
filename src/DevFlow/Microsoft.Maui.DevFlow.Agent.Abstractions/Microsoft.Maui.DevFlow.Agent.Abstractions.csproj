@@ -14,11 +14,11 @@
     <PackageReference Include="Fizzler" />
     <PackageReference Include="SkiaSharp" />
 
-    <!-- The SQLite browser. .Core rather than Microsoft.Data.Sqlite so nothing registers a provider
-         behind our back: the host app may already have one, and replacing it would change how the
-         app under test talks to its own database. SqliteGateway decides. -->
-    <PackageReference Include="Microsoft.Data.Sqlite.Core" />
-    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
+    <!-- The SQLite browser, on SQLitePCLRaw's core and nothing more. No bundle, so the agent brings no
+         provider to compete with the app's; and no ADO.NET provider, whose connection registers the
+         batteries bundle from a static constructor and would replace the one the app set up.
+         SqliteGateway opens every database with the app's own provider. -->
+    <PackageReference Include="SQLitePCLRaw.core" />
   </ItemGroup>
 
   <ItemGroup>

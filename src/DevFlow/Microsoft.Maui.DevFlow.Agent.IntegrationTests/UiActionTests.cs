@@ -411,11 +411,11 @@ public class UiActionTests : IntegrationTestBase
     }
 
     // ========== raw-touch tier: views that take their touches directly ==========
-    // A GraphicsView — like SkiaSharp's SKCanvasView — overrides the platform touch methods
-    // and installs no gesture recognizer, so nothing above can service it. Android delivers
-    // real MotionEvents; iOS and Mac Catalyst synthesise UITouches, which the sample opts
-    // into with AgentOptions.EnableSyntheticTouch. The status label reports the whole
-    // sequence, so these assert what the app actually received rather than an HTTP 200.
+    // A GraphicsView overrides the platform touch methods and installs no gesture recognizer,
+    // so nothing above can service it. Android delivers real MotionEvents; iOS and Mac Catalyst
+    // synthesise UITouches, which the sample opts into with AgentOptions.EnableSyntheticTouch,
+    // and only to an allow-list of views. The status label reports the whole sequence, so these
+    // assert what the app actually received rather than an HTTP 200.
 
     private bool SupportsRawTouchInjection =>
         Platform.Equals("android", StringComparison.OrdinalIgnoreCase)
@@ -495,6 +495,111 @@ public class UiActionTests : IntegrationTestBase
         await SettleAsync();
         var status = await FindElementAsync("RawTouchStatusLabel");
         Assert.Contains("dy=60", status.Text);
+    }
+
+    // The synthesised-touch cases below are UIKit-only: Android delivers real touches, which
+    // behave exactly as a finger would — including pressing a button that is dragged across.
+    private bool SupportsSyntheticTouch =>
+        Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+        || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
+
+    private static int ReadRawTouchDx(string? statusText)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(statusText ?? "", @"dx=(-?\d+)");
+        Assert.True(match.Success, $"No dx in '{statusText}'");
+        return int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    [Fact]
+    public async Task Swipe_OnRawTouchView_ArrivesAsADrag()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.True(ReadRawTouchDx(status.Text) > 0, status.Text);
+    }
+
+    [Fact]
+    public async Task Pan_OnRawTouchView_LongerThanTheView_IsShortenedToStayOnIt()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        // Started centred and offset by half the delta, a drag this long would begin far off
+        // the canvas and land on whatever sits beside it.
+        var result = await Client.PanAsync(target.Id, deltaX: 5000, deltaY: 0);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.InRange(ReadRawTouchDx(status.Text), 1, 4999);
+    }
+
+    [Theory]
+    [InlineData(0.0, 0.0)]
+    [InlineData(1.0, 1.0)]
+    public async Task Pinch_OnRawTouchView_FromAnEdgeOrigin_KeepsBothFingersOnTheView(double originX, double originY)
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.PinchAsync(target.Id, scale: 0.5, originX: originX, originY: originY);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.Contains("maxtouches=2", status.Text);
+        Assert.Contains("scale=0.50", status.Text);
+    }
+
+    [Fact]
+    public async Task Pan_OnAnOrdinaryButton_NeverDeliversSyntheticTouches()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            return;
+        }
+
+        await NavigateToGesturePageAsync();
+        await Client.ScrollAsync("SyntheticTouchGuardButton");
+        await SettleAsync();
+        var button = await FindElementAsync("SyntheticTouchGuardButton");
+
+        // UIButton overrides touchesBegan:, which is exactly what used to qualify a view for
+        // synthesised touches. Vertical, so no enclosing horizontal pan (Shell's flyout) is involved.
+        await Client.PanAsync(button.Id, deltaX: 0, deltaY: 10);
+
+        // Whether another tier claims the pan is beside the point: the button must not be pressed.
+        await SettleAsync();
+        var status = await FindElementAsync("GuardStatusLabel");
+        Assert.Equal("guard: pressed=0 clicked=0", status.Text);
     }
 
     [Fact]

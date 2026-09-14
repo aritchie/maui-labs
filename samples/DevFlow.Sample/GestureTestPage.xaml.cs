@@ -27,6 +27,9 @@ public partial class GestureTestPage : ContentPage
     private int _rawTouchDragCount;
     private double _rawTouchPeakScale = 1;
 
+    private int _guardPressed;
+    private int _guardClicked;
+
     public GestureTestPage()
     {
         InitializeComponent();
@@ -113,6 +116,21 @@ public partial class GestureTestPage : ContentPage
     }
 
     private void OnRawTouchEnded(object? sender, TouchEventArgs e) => Report(e, "ended");
+
+    private void OnGuardButtonPressed(object? sender, EventArgs e)
+    {
+        _guardPressed++;
+        ReportGuard();
+    }
+
+    private void OnGuardButtonClicked(object? sender, EventArgs e)
+    {
+        _guardClicked++;
+        ReportGuard();
+    }
+
+    private void ReportGuard()
+        => GuardStatusLabel.Text = $"guard: pressed={_guardPressed} clicked={_guardClicked}";
 
     private void Report(TouchEventArgs e, string phase)
     {

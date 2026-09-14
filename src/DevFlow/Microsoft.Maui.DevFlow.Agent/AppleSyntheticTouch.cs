@@ -9,9 +9,10 @@ namespace Microsoft.Maui.DevFlow.Agent;
 
 /// <summary>
 /// A synthesised <see cref="UITouch"/>, for the views that recogniser driving cannot reach:
-/// SkiaSharp's SKCanvasView, MAUI's GraphicsView, and any other UIView that takes input by
-/// overriding <c>touchesBegan:</c> instead of installing a gesture recogniser. Those views own
-/// no recogniser to drive and no scroll offset to nudge, so a synthetic touch is the only way in.
+/// MAUI's GraphicsView, and any other UIView that takes input by overriding <c>touchesBegan:</c>
+/// instead of installing a gesture recogniser. Those views own no recogniser to drive and no
+/// scroll offset to nudge, so a synthetic touch is the only way in. Which views qualify is
+/// decided by <see cref="AppleRawTouchPolicy"/>.
 ///
 /// UITouch exposes no public way to set a location or a phase, so both are written through the
 /// object's ivars. Every write checks the ivar's type encoding first, and the finished touch is
@@ -284,14 +285,20 @@ internal sealed class SyntheticTouchEvent : UIEvent
 /// </summary>
 internal static class AppleTouchInjector
 {
+    /// <summary>
+    /// Delivers the sequence to <paramref name="target"/>, which the caller has already
+    /// resolved and accepted. Nothing is delivered unless every finger's starting point
+    /// hit-tests to that same view: a real finger landing on an overlay would have gone to
+    /// the overlay, so a mismatch is reported as unhandled rather than routed anyway.
+    /// </summary>
     internal static async Task<bool> InjectAsync(
-        UIView view,
+        UIView target,
         Func<double, CGPoint[]> positionsAt,
         int durationMs,
         int steps,
         int holdMs = 0)
     {
-        var window = view.Window;
+        var window = target.Window;
         if (window == null)
             return false;
 
@@ -299,9 +306,16 @@ internal static class AppleTouchInjector
         if (start.Length == 0)
             return false;
 
-        // Everything is delivered to the view under the first finger, the way UIKit keeps a
-        // gesture with the view that received its first touch.
-        var target = window.HitTest(start[0], null) ?? view;
+        foreach (var point in start)
+        {
+            if (!ReferenceEquals(window.HitTest(point, null), target))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Microsoft.Maui.DevFlow] Synthetic touch at ({point.X:0.#}, {point.Y:0.#}) does not land on {target.GetType().Name}.");
+                return false;
+            }
+        }
+
         var touches = new List<AppleSyntheticTouch>(start.Length);
 
         try
@@ -358,13 +372,73 @@ internal static class AppleTouchInjector
         }
     }
 
+}
+
+/// <summary>
+/// Decides which views may be handed synthesised touches. Overriding <c>touchesBegan:</c> is
+/// not enough of a signal — UIControl, UIScrollView and text views all override it, and a pan
+/// delivered to a UIButton fires its action — so acceptance is a positive allow-list: MAUI's
+/// GraphicsView, plus any type the app names in <c>AgentOptions.SyntheticTouchViewTypes</c>.
+/// The exclusions win over a registration, so naming a base class cannot opt controls back in.
+/// </summary>
+internal sealed class AppleRawTouchPolicy
+{
+    private readonly HashSet<string> _registeredTypes;
+
+    internal AppleRawTouchPolicy(IEnumerable<string> registeredTypes)
+        => _registeredTypes = new HashSet<string>(
+            registeredTypes.Where(name => !string.IsNullOrWhiteSpace(name)).Select(name => name.Trim()),
+            StringComparer.Ordinal);
+
     /// <summary>
-    /// True when <paramref name="view"/> takes touches directly rather than through a recogniser —
-    /// the case synthetic touches exist for. Detected by comparing the view's implementation of
-    /// <c>touchesBegan:withEvent:</c> with UIView's: a class that has not overridden it inherits
-    /// the stock implementation and would simply forward our touches up the responder chain.
+    /// The accepted view a finger at <paramref name="pointInWindow"/> would land on, provided it is
+    /// the element the caller named or part of it. An overlay from some other element — or any
+    /// view the policy refuses — resolves to null, and the gesture is reported as unhandled.
     /// </summary>
-    internal static bool IsRawTouchView(UIView view)
+    internal UIView? Resolve(UIView element, CGPoint pointInWindow)
+        => element.Window?.HitTest(pointInWindow, null) is { } hit
+           && (ReferenceEquals(hit, element) || hit.IsDescendantOfView(element))
+           && Accepts(hit)
+            ? hit
+            : null;
+
+    internal bool Accepts(UIView view)
+        => !IsExcluded(view) && IsRegistered(view) && OverridesTouchesBegan(view);
+
+    private static bool IsExcluded(UIView view)
+    {
+        // Controls fire actions from their own touch tracking, and scroll views — table,
+        // collection and text views among them — scroll from it.
+        if (view is UIControl or UIScrollView)
+            return true;
+
+        // A view whose input goes through a recognizer never sees touches handed straight to
+        // the view. SkiaSharp's SKCanvasView is one: its SKTouchHandler is a UIGestureRecognizer.
+        // Hover is the exception — GraphicsView installs one, and it takes no touches.
+        return view.GestureRecognizers?.Any(r => r.Enabled && r is not UIHoverGestureRecognizer) == true;
+    }
+
+    private bool IsRegistered(UIView view)
+    {
+        if (view is Microsoft.Maui.Platform.PlatformTouchGraphicsView)
+            return true;
+
+        // Stops short of UIView itself: registering the root type would accept everything.
+        for (var type = view.GetType(); type != null && type != typeof(UIView); type = type.BaseType)
+        {
+            if (_registeredTypes.Contains(type.Name)
+                || (type.FullName is { } fullName && _registeredTypes.Contains(fullName)))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A registered view that inherits UIView's <c>touchesBegan:withEvent:</c> would only forward
+    /// the touches up the responder chain, to whatever happens to sit above it.
+    /// </summary>
+    private static bool OverridesTouchesBegan(UIView view)
     {
         try
         {
@@ -382,9 +456,5 @@ internal static class AppleTouchInjector
             return false;
         }
     }
-
-    /// <summary>The view a gesture at <paramref name="point"/> would actually land on.</summary>
-    internal static UIView? HitTest(UIView view, CGPoint pointInWindow)
-        => view.Window?.HitTest(pointInWindow, null);
 }
 #endif

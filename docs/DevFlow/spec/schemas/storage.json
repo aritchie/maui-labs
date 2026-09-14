@@ -142,7 +142,10 @@
               "list",
               "download",
               "upload",
-              "delete"
+              "delete",
+              "create-directory",
+              "delete-directory",
+              "move"
             ]
           },
           "description": "File operations supported by this root."

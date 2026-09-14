@@ -403,7 +403,9 @@ public class SqliteBrowserTests
         private readonly string _root;
 
         public RootedAgentService(int port, string root)
-            : base(new AgentOptions { Port = port, RequireMutationLease = false })
+            // Leases stay on, as they are by default: every write route here has to get through the
+            // same gate a real session puts it behind, or a client that forgets to claim one passes.
+            : base(new AgentOptions { Port = port })
             => _root = root;
 
         protected override string GetAppDataBasePath() => _root;

@@ -2682,17 +2682,22 @@ public class AgentClient : IDisposable
     /// <summary>Uploads raw bytes, skipping the third of extra wire traffic base64 costs.</summary>
     public async Task<JsonElement> UploadFileBytesAsync(string path, byte[] content, string? root = null)
     {
-        using var body = new ByteArrayContent(content);
-        body.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-
-        using var response = await _http.PutAsync($"{_baseUrl}{StorageApi}/files/{Uri.EscapeDataString(path)}{BuildRootQuery(root)}", body);
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Put, async () =>
+        {
+            using var body = new ByteArrayContent(content);
+            body.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            return await _http.PutAsync($"{_baseUrl}{StorageApi}/files/{Uri.EscapeDataString(path)}{BuildRootQuery(root)}", body);
+        });
         return await ReadJsonAsync(response);
     }
 
     public async Task<JsonElement> CreateDirectoryAsync(string path, string? root = null)
     {
-        using var content = ProtocolJson.CreateJsonContent(new JsonObject());
-        using var response = await _http.PutAsync($"{_baseUrl}{StorageApi}/directories/{Uri.EscapeDataString(path)}{BuildRootQuery(root)}", content);
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Put, async () =>
+        {
+            using var content = ProtocolJson.CreateJsonContent(new JsonObject());
+            return await _http.PutAsync($"{_baseUrl}{StorageApi}/directories/{Uri.EscapeDataString(path)}{BuildRootQuery(root)}", content);
+        });
         return await ReadJsonAsync(response);
     }
 
@@ -2716,8 +2721,11 @@ public class AgentClient : IDisposable
             ["overwrite"] = overwrite
         };
 
-        using var content = ProtocolJson.CreateJsonContent(body);
-        using var response = await _http.PostAsync($"{_baseUrl}{StorageApi}/files/move{BuildRootQuery(root)}", content);
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Post, async () =>
+        {
+            using var content = ProtocolJson.CreateJsonContent(body);
+            return await _http.PostAsync($"{_baseUrl}{StorageApi}/files/move{BuildRootQuery(root)}", content);
+        });
         return await ReadJsonAsync(response);
     }
 
@@ -2753,8 +2761,12 @@ public class AgentClient : IDisposable
 
     public async Task<JsonElement> UpdateDatabaseRowAsync(string path, string table, long rowId, IEnumerable<(string Column, string? Value)> changes, string? root = null)
     {
-        using var content = ProtocolJson.CreateJsonContent(DatabaseRowBody(path, table, rowId, changes));
-        using var response = await _http.PutAsync($"{_baseUrl}{StorageApi}/sqlite/rows{BuildRootQuery(root)}", content);
+        var body = DatabaseRowBody(path, table, rowId, changes);
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Put, async () =>
+        {
+            using var content = ProtocolJson.CreateJsonContent(body);
+            return await _http.PutAsync($"{_baseUrl}{StorageApi}/sqlite/rows{BuildRootQuery(root)}", content);
+        });
         return await ReadJsonAsync(response);
     }
 
@@ -2765,10 +2777,17 @@ public class AgentClient : IDisposable
     public Task<JsonElement> CreateDatabaseAsync(string path, string? root = null)
         => PostSqliteAsync("create", new JsonObject { ["path"] = path }, root);
 
+    /// <remarks>
+    /// Every one of these can write - the query pane runs UPDATE and DDL as readily as SELECT - so all
+    /// of them go through the lease, the same as the agent's route table requires.
+    /// </remarks>
     private async Task<JsonElement> PostSqliteAsync(string route, JsonObject body, string? root)
     {
-        using var content = ProtocolJson.CreateJsonContent(body);
-        using var response = await _http.PostAsync($"{_baseUrl}{StorageApi}/sqlite/{route}{BuildRootQuery(root)}", content);
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Post, async () =>
+        {
+            using var content = ProtocolJson.CreateJsonContent(body);
+            return await _http.PostAsync($"{_baseUrl}{StorageApi}/sqlite/{route}{BuildRootQuery(root)}", content);
+        });
         return await ReadJsonAsync(response);
     }
 

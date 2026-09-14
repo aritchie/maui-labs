@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Maui.DevFlow.Agent.Core;
 using Microsoft.Maui.DevFlow.Driver;
 using Microsoft.Maui.Dispatching;
@@ -28,6 +29,52 @@ public class FileStorageRootTests
         Assert.DoesNotContain("basePath", result.ToString(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(appDataPath, result.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(customPath, result.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StorageRoots_ResponseMatchesTheProtocolSchema()
+    {
+        using var service = new PlainAgentService(GetFreePort(), CreateTempDirectory(), CreateTempDirectory());
+        using var client = new AgentClient("localhost", service.ServicePort);
+
+        service.StartServerOnly(new DelegateAgentDispatcher(() => false, action => action()));
+
+        var result = await WaitForJsonAsync(client.ListStorageRootsAsync);
+        var roots = result.GetProperty("roots").EnumerateArray().ToArray();
+        Assert.Equal(["appData", "cache"], roots.Select(x => x.GetProperty("id").GetString()));
+
+        var schema = LoadSpecSchema("storage.json")["$defs"]!["StorageRoot"]!;
+        var required = schema["required"]!.AsArray().Select(x => x!.GetValue<string>()).ToArray();
+        var declared = schema["properties"]!.AsObject().Select(x => x.Key).ToHashSet();
+        var operations = schema["properties"]!["supportedOperations"]!["items"]!["enum"]!
+            .AsArray().Select(x => x!.GetValue<string>()).ToHashSet();
+
+        foreach (var root in roots)
+        {
+            foreach (var name in required)
+                Assert.True(root.TryGetProperty(name, out _), $"Root '{root.GetProperty("id")}' is missing required '{name}'.");
+
+            foreach (var property in root.EnumerateObject())
+                Assert.True(declared.Contains(property.Name), $"Root '{root.GetProperty("id")}' sends '{property.Name}', which the schema does not declare.");
+
+            foreach (var operation in root.GetProperty("supportedOperations").EnumerateArray())
+                Assert.True(operations.Contains(operation.GetString()!), $"'{operation}' is not an operation the schema allows.");
+        }
+    }
+
+    [Fact]
+    public async Task StorageRoots_WithoutAKnownCacheDirectory_AdvertiseNoCacheRoot()
+    {
+        // The base service has no idea where this app's cache is, and the shared temp directory is
+        // not it - so there is no cache root rather than a writable view of everyone's temp files.
+        using var service = new PlainAgentService(GetFreePort(), CreateTempDirectory(), cachePath: null);
+        using var client = new AgentClient("localhost", service.ServicePort);
+
+        service.StartServerOnly(new DelegateAgentDispatcher(() => false, action => action()));
+
+        var result = await WaitForJsonAsync(client.ListStorageRootsAsync);
+
+        Assert.Equal(["appData"], result.GetProperty("roots").EnumerateArray().Select(x => x.GetProperty("id").GetString()));
     }
 
     [Fact]
@@ -297,7 +344,8 @@ public class FileStorageRootTests
         private readonly IReadOnlyList<FileStorageRoot> _roots;
 
         public RootedDevFlowAgentService(int port, IReadOnlyList<TestStorageRoot> roots)
-            : base(new AgentOptions { Port = port, RequireMutationLease = false })
+            // Leases on, as they are by default, so a client route that skips the lease fails here.
+            : base(new AgentOptions { Port = port })
         {
             ServicePort = port;
             _roots = roots.Select(root => new FileStorageRoot(
@@ -316,6 +364,29 @@ public class FileStorageRootTests
         public int ServicePort { get; }
 
         protected override IReadOnlyList<FileStorageRoot> GetFileStorageRoots() => _roots;
+    }
+
+    /// <summary>The framework-neutral service, with nothing overridden but where app data lives.</summary>
+    private sealed class PlainAgentService(int port, string appDataPath, string? cachePath)
+        : DevFlowAgentService(new AgentOptions { Port = port })
+    {
+        public int ServicePort => port;
+
+        protected override string GetAppDataBasePath() => appDataPath;
+
+        protected override string? GetCacheBasePath() => cachePath ?? base.GetCacheBasePath();
+    }
+
+    private static JsonNode LoadSpecSchema(string name)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var candidate = Path.Combine(directory.FullName, "docs", "DevFlow", "spec", "schemas", name);
+            if (File.Exists(candidate))
+                return JsonNode.Parse(File.ReadAllText(candidate))!;
+        }
+
+        throw new InvalidOperationException($"Could not find docs/DevFlow/spec/schemas/{name} from the test output directory.");
     }
 
     private sealed class TestStorageRoot

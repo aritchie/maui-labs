@@ -144,8 +144,12 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
     /// Base path used to resolve the cache storage root - where half the "why is my app 400MB"
     /// questions are answered, and worth browsing even though the OS may empty it at any moment.
     /// </summary>
-    protected virtual string GetCacheBasePath()
-        => Path.Combine(Path.GetTempPath(), "devflow-cache");
+    /// <returns>
+    /// The app's own cache directory, or null when the backend does not know it. Null by default: the
+    /// shared temp directory is not this app's cache, and advertising it as one would hand out a
+    /// writable root over files that belong to everything else on the machine.
+    /// </returns>
+    protected virtual string? GetCacheBasePath() => null;
 
     /// <summary>
     /// Releases backend owned resources during <see cref="Dispose"/>.

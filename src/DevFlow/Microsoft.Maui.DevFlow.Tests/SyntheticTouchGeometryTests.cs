@@ -3,8 +3,9 @@ using Microsoft.Maui.DevFlow.Agent.Core;
 namespace Microsoft.Maui.DevFlow.Tests;
 
 /// <summary>
-/// On iOS and Mac Catalyst a synthesised touch is only delivered when every finger starts on the
-/// target view, so the geometry has to keep each point inside the bounds whatever was requested.
+/// Injected touches must start on the view the caller named — UIKit refuses them otherwise, and on
+/// Android a pointer off the view would be a gesture the view never sees — so the geometry has to
+/// keep each point inside the bounds whatever was requested.
 /// </summary>
 public class SyntheticTouchGeometryTests
 {
@@ -104,4 +105,33 @@ public class SyntheticTouchGeometryTests
     [InlineData(Inset * 2, Height, 2)]
     public void Pinch_IsRefusedWhenItCannotBeDelivered(double width, double height, double scale)
         => Assert.Null(SyntheticTouchGeometry.ForPinch(width, height, 0.5, 0.5, scale));
+
+    [Theory]
+    [InlineData(0.5, 0.5)]
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    [InlineData(0, 1)]
+    [InlineData(-3, 7)]
+    public void Rotation_FromAnyOrigin_KeepsBothFingersOnTheViewAtEveryAngle(double originX, double originY)
+    {
+        var rotation = SyntheticTouchGeometry.ForRotation(Width, Height, originX, originY);
+
+        Assert.NotNull(rotation);
+        var r = rotation.Value;
+        for (var degrees = 0; degrees < 360; degrees += 15)
+        {
+            var radians = degrees * Math.PI / 180;
+            var dx = Math.Cos(radians) * r.Radius;
+            var dy = Math.Sin(radians) * r.Radius;
+            AssertOnView(r.CenterX - dx, r.CenterY - dy);
+            AssertOnView(r.CenterX + dx, r.CenterY + dy);
+        }
+    }
+
+    [Theory]
+    [InlineData(Width, Inset * 2, 0.5)]
+    [InlineData(0, Height, 0.5)]
+    [InlineData(Width, Height, double.NaN)]
+    public void Rotation_IsRefusedWhenItCannotBeDelivered(double width, double height, double originX)
+        => Assert.Null(SyntheticTouchGeometry.ForRotation(width, height, originX, 0.5));
 }

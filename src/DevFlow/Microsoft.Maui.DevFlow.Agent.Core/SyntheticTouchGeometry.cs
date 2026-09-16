@@ -1,10 +1,10 @@
 namespace Microsoft.Maui.DevFlow.Agent.Core;
 
 /// <summary>
-/// Where synthesised touches go on a raw-touch view, in the view's own coordinates. Every
-/// point stays strictly inside the bounds: a finger that starts off the view hit-tests to
-/// whatever is beside it, and the far edge of a rect counts as outside. Free of UIKit so the
-/// arithmetic can be tested off-device.
+/// Where injected touches go on a view, in the view's own device-independent coordinates. Every
+/// point stays strictly inside the bounds: a finger that starts off the view hits whatever is
+/// beside it, and the far edge of a rect counts as outside. Shared by the UIKit synthetic-touch
+/// tier and Android's MotionEvent injection, and free of both so it can be tested off-device.
 /// </summary>
 internal static class SyntheticTouchGeometry
 {
@@ -12,6 +12,8 @@ internal static class SyntheticTouchGeometry
     internal const double EdgeInset = 2;
 
     internal readonly record struct Pinch(double CenterX, double CenterY, double StartRadius, double EndRadius);
+
+    internal readonly record struct Rotation(double CenterX, double CenterY, double Radius);
 
     internal readonly record struct Drag(double StartX, double StartY, double DeltaX, double DeltaY);
 
@@ -34,6 +36,22 @@ internal static class SyntheticTouchGeometry
         // fingers never travel beyond the radius the view can hold.
         var (start, end) = scale >= 1 ? (radius / scale, radius) : (radius, radius * scale);
         return new Pinch(centerX, centerY, start, end);
+    }
+
+    /// <summary>
+    /// Two fingers opposite each other on a circle around the origin, free to turn to any angle.
+    /// The origin is moved inwards on both axes until the whole circle fits. Null when the view is
+    /// too small to hold a touch.
+    /// </summary>
+    internal static Rotation? ForRotation(double width, double height, double originX, double originY)
+    {
+        if (!HasRoom(width, height) || !double.IsFinite(originX) || !double.IsFinite(originY))
+            return null;
+
+        var radius = Math.Min(Math.Min(width, height) * 0.4, Math.Min(width, height) / 2 - EdgeInset);
+        var centerX = Math.Clamp(width * originX, EdgeInset + radius, width - EdgeInset - radius);
+        var centerY = Math.Clamp(height * originY, EdgeInset + radius, height - EdgeInset - radius);
+        return new Rotation(centerX, centerY, radius);
     }
 
     /// <summary>

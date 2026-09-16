@@ -22,8 +22,9 @@ namespace Microsoft.Maui.DevFlow.Agent;
 ///
 /// Fidelity varies by platform, and each method reports how it was handled so callers can tell:
 /// <list type="bullet">
-/// <item>Android — genuine multi-pointer <c>MotionEvent</c>s dispatched through the activity,
-/// so the whole hit-test and <c>GestureDetector</c> pipeline runs. Fully faithful.</item>
+/// <item>Android — genuine multi-pointer <c>MotionEvent</c>s dispatched to the named element's
+/// view, so its own hit-testing and <c>GestureDetector</c> pipeline runs and no sibling or ancestor
+/// can take the stream. Every initial pointer starts inside the visible part of that view.</item>
 /// <item>iOS / Mac Catalyst — drives the real native zoom/pan surfaces (MKMapView camera and
 /// centre, UIScrollView zoom/offset), then the attached UIGestureRecognizers, and finally —
 /// when <c>AgentOptions.EnableSyntheticTouch</c> is on — synthesised <c>UITouch</c>es delivered
@@ -123,6 +124,11 @@ public partial class PlatformAgentService
 
     private static global::Android.Views.View? GetAndroidView(VisualElement element)
     {
+        // The container wraps the platform view when the element has a shadow, clip or border,
+        // and is where MAUI attaches its own touch handling; touches reach the platform view through it.
+        if (element.Handler is IViewHandler { ContainerView: global::Android.Views.View container })
+            return container;
+
         if (element.Handler?.PlatformView is global::Android.Views.View view)
             return view;
 
@@ -133,33 +139,57 @@ public partial class PlatformAgentService
     }
 
     /// <summary>
-    /// Element centre and half-extent in window pixels, plus the display density.
-    /// Returns null when the view has no measured size to aim at.
+    /// The on-screen part of a view that a finger can reach. Geometry is worked out in
+    /// device-independent units across this visible rect — the same units and rules as the
+    /// UIKit tier — and <see cref="ToView"/> turns it into the view's own pixels.
     /// </summary>
-    private static (PointF Center, float Radius, float Density)? GetAndroidTouchGeometry(
-        global::Android.Views.View view, Point origin)
+    private readonly record struct AndroidTouchSurface(
+        float Left, float Top, float Density, double Width, double Height)
     {
-        if (view.Width <= 0 || view.Height <= 0)
-            return null;
-
-        var location = new int[2];
-        view.GetLocationInWindow(location);
-
-        var center = new PointF(
-            location[0] + (float)(view.Width * origin.X),
-            location[1] + (float)(view.Height * origin.Y));
-
-        // Keep both pinch pointers comfortably inside the view.
-        var radius = Math.Min(view.Width, view.Height) * 0.4f;
-        var density = view.Resources?.DisplayMetrics?.Density ?? 1f;
-        return (center, radius, density);
+        internal PointF ToView(double x, double y) => new(Left + (float)(x * Density), Top + (float)(y * Density));
     }
 
     /// <summary>
-    /// Dispatches a full touch sequence (down → moves → up) through the activity so the
-    /// real hit-test and gesture-detection pipeline runs. <paramref name="positionsAt"/>
-    /// is sampled with t in 0..1 and must return one point per pointer, in window pixels.
+    /// Null when the view is not laid out or cannot be brought on screen, so no touch could reach it.
+    /// A view scrolled wholly or partly out of sight is first scrolled into view, as a user would
+    /// before touching it.
     /// </summary>
+    private static AndroidTouchSurface? GetAndroidTouchSurface(global::Android.Views.View view)
+    {
+        if (view.Width <= 0 || view.Height <= 0 || !view.IsShown)
+            return null;
+
+        var visible = new global::Android.Graphics.Rect();
+        if (!view.GetLocalVisibleRect(visible) || visible.Width() < view.Width || visible.Height() < view.Height)
+        {
+            view.RequestRectangleOnScreen(new global::Android.Graphics.Rect(0, 0, view.Width, view.Height), true);
+            if (!view.GetLocalVisibleRect(visible))
+                return null;
+        }
+
+        if (visible.IsEmpty)
+            return null;
+
+        var density = view.Resources?.DisplayMetrics?.Density ?? 1f;
+        if (!(density > 0))
+            density = 1f;
+
+        return new AndroidTouchSurface(
+            visible.Left, visible.Top, density, visible.Width() / density, visible.Height() / density);
+    }
+
+    /// <summary>
+    /// Dispatches a full touch sequence (down → moves → up) to <paramref name="targetView"/>.
+    /// <paramref name="positionsAt"/> is sampled with t in 0..1 and must return one point per
+    /// pointer, in the target's own pixels, each inside the target.
+    /// </summary>
+    /// <remarks>
+    /// The events go to the target rather than through the activity. Dispatching through the
+    /// window lets a sibling drawn over the target, or an ancestor that intercepts the down,
+    /// take the stream while the response names the target; delivered here, only the target and
+    /// its descendants can receive it, and a target that refuses the down reports unhandled
+    /// exactly as a real finger's gesture would end there.
+    /// </remarks>
     private static async Task<bool> InjectAndroidTouchAsync(
         global::Android.Views.View targetView,
         int pointerCount,
@@ -169,9 +199,10 @@ public partial class PlatformAgentService
         int holdMs = 0,
         int settleMs = 0)
     {
-        var activity = global::Microsoft.Maui.ApplicationModel.Platform.CurrentActivity;
-        var targetLocation = new int[2];
-        targetView.GetLocationInWindow(targetLocation);
+        // Events are built in screen coordinates and shifted into the view's, which leaves
+        // getRawX/getRawY pointing at the screen the way a real touch does.
+        var screen = new int[2];
+        targetView.GetLocationOnScreen(screen);
 
         var properties = new MotionEvent.PointerProperties[pointerCount];
         var coords = new MotionEvent.PointerCoords[pointerCount];
@@ -189,67 +220,29 @@ public partial class PlatformAgentService
         {
             for (var i = 0; i < pointerCount; i++)
             {
-                coords[i].X = points[i].X;
-                coords[i].Y = points[i].Y;
+                coords[i].X = points[i].X + screen[0];
+                coords[i].Y = points[i].Y + screen[1];
             }
         }
 
         bool Send(MotionEventActions action, int activePointers)
         {
-            static MotionEvent? CreateEvent(
-                long downTime,
-                long eventTime,
-                MotionEventActions action,
-                int activePointers,
-                MotionEvent.PointerProperties[] properties,
-                MotionEvent.PointerCoords[] coords)
-                => MotionEvent.Obtain(
-                    downTime, eventTime, action, activePointers,
-                    properties[..activePointers], coords[..activePointers],
-                    0, (MotionEventButtonState)0, 1f, 1f, 0, (Edge)0,
-                    InputSourceType.Touchscreen, (MotionEventFlags)0);
-
-            if (activity != null)
-            {
-                var windowEvent = CreateEvent(
-                    downTime, eventTime, action, activePointers, properties, coords);
-                if (windowEvent != null)
-                {
-                    try
-                    {
-                        if (activity.DispatchTouchEvent(windowEvent))
-                            return true;
-                    }
-                    finally
-                    {
-                        windowEvent.Recycle();
-                    }
-                }
-            }
-
-            var localCoords = new MotionEvent.PointerCoords[activePointers];
-            for (var i = 0; i < activePointers; i++)
-            {
-                localCoords[i] = new MotionEvent.PointerCoords
-                {
-                    X = coords[i].X - targetLocation[0],
-                    Y = coords[i].Y - targetLocation[1],
-                    Pressure = coords[i].Pressure,
-                    Size = coords[i].Size
-                };
-            }
-
-            var localEvent = CreateEvent(
-                downTime, eventTime, action, activePointers, properties, localCoords);
-            if (localEvent == null)
+            var motionEvent = MotionEvent.Obtain(
+                downTime, eventTime, action, activePointers,
+                properties[..activePointers], coords[..activePointers],
+                0, (MotionEventButtonState)0, 1f, 1f, 0, (Edge)0,
+                InputSourceType.Touchscreen, (MotionEventFlags)0);
+            if (motionEvent == null)
                 return false;
+
             try
             {
-                return targetView.DispatchTouchEvent(localEvent);
+                motionEvent.OffsetLocation(-screen[0], -screen[1]);
+                return targetView.DispatchTouchEvent(motionEvent);
             }
             finally
             {
-                localEvent.Recycle();
+                motionEvent.Recycle();
             }
         }
 
@@ -257,17 +250,15 @@ public partial class PlatformAgentService
         {
             Apply(positionsAt(0));
 
-            var handled = Send(MotionEventActions.Down, 1);
+            // A view that does not take the down never sees the rest of a real gesture either.
+            if (!Send(MotionEventActions.Down, 1))
+                return false;
+
+            var handled = true;
             for (var i = 1; i < pointerCount; i++)
-                handled |= Send(
+                handled &= Send(
                     (MotionEventActions)((int)MotionEventActions.PointerDown | (i << PointerIndexShift)),
                     i + 1);
-
-            // Keep the gesture on the element the caller named. Without this an enclosing
-            // ScrollView steals a vertical drag once it passes the touch slop — correct for a
-            // real finger, wrong for "pan this canvas". Ancestors only: the target view itself
-            // still handles the gesture normally. Must follow the down, which resets the flag.
-            targetView.Parent?.RequestDisallowInterceptTouchEvent(true);
 
             if (holdMs > 0)
             {
@@ -279,7 +270,7 @@ public partial class PlatformAgentService
             {
                 eventTime += Math.Max(1, stepDelay);
                 Apply(positionsAt((double)step / steps));
-                handled |= Send(MotionEventActions.Move, pointerCount);
+                Send(MotionEventActions.Move, pointerCount);
                 if (stepDelay > 0) await Task.Delay(stepDelay);
             }
 
@@ -290,7 +281,7 @@ public partial class PlatformAgentService
             {
                 await Task.Delay(settleMs);
                 eventTime += settleMs;
-                handled |= Send(MotionEventActions.Move, pointerCount);
+                Send(MotionEventActions.Move, pointerCount);
             }
 
             eventTime += 1;
@@ -304,36 +295,25 @@ public partial class PlatformAgentService
             System.Diagnostics.Debug.WriteLine($"[Microsoft.Maui.DevFlow] Android touch injection failed: {ex.GetBaseException().Message}");
             return false;
         }
-        finally
-        {
-            targetView.Parent?.RequestDisallowInterceptTouchEvent(false);
-        }
     }
 
     private static async Task<string?> AndroidPinchAsync(VisualElement element, double scale, Point origin, int durationMs, int steps)
     {
-        var view = GetAndroidView(element);
-        if (view == null) return null;
-        if (GetAndroidTouchGeometry(view, origin) is not { } geometry) return null;
-
-        var (center, maxRadius, _) = geometry;
-
-        // Pick start/end radii so both ends of the pinch stay inside the view:
-        // zooming in starts close together, zooming out starts far apart.
-        var (startRadius, endRadius) = scale >= 1
-            ? ((float)(maxRadius / scale), maxRadius)
-            : (maxRadius, (float)(maxRadius * scale));
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return null;
+        if (Core.SyntheticTouchGeometry.ForPinch(surface.Width, surface.Height, origin.X, origin.Y, scale) is not { } pinch)
+            return null;
 
         var handled = await InjectAndroidTouchAsync(
             view,
             pointerCount: 2,
             positionsAt: t =>
             {
-                var r = startRadius + (endRadius - startRadius) * (float)t;
+                var r = pinch.StartRadius + (pinch.EndRadius - pinch.StartRadius) * t;
                 return
                 [
-                    new PointF(center.X - r, center.Y),
-                    new PointF(center.X + r, center.Y)
+                    surface.ToView(pinch.CenterX - r, pinch.CenterY),
+                    surface.ToView(pinch.CenterX + r, pinch.CenterY)
                 ];
             },
             durationMs: durationMs > 0 ? durationMs : 200,
@@ -344,11 +324,11 @@ public partial class PlatformAgentService
 
     private static async Task<string?> AndroidRotateAsync(VisualElement element, double degrees, Point origin, int durationMs, int steps)
     {
-        var view = GetAndroidView(element);
-        if (view == null) return null;
-        if (GetAndroidTouchGeometry(view, origin) is not { } geometry) return null;
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return null;
+        if (Core.SyntheticTouchGeometry.ForRotation(surface.Width, surface.Height, origin.X, origin.Y) is not { } rotation)
+            return null;
 
-        var (center, radius, _) = geometry;
         var totalRadians = degrees * Math.PI / 180.0;
 
         var handled = await InjectAndroidTouchAsync(
@@ -357,12 +337,12 @@ public partial class PlatformAgentService
             positionsAt: t =>
             {
                 var angle = totalRadians * t;
-                var dx = (float)(Math.Cos(angle) * radius);
-                var dy = (float)(Math.Sin(angle) * radius);
+                var dx = Math.Cos(angle) * rotation.Radius;
+                var dy = Math.Sin(angle) * rotation.Radius;
                 return
                 [
-                    new PointF(center.X - dx, center.Y - dy),
-                    new PointF(center.X + dx, center.Y + dy)
+                    surface.ToView(rotation.CenterX - dx, rotation.CenterY - dy),
+                    surface.ToView(rotation.CenterX + dx, rotation.CenterY + dy)
                 ];
             },
             durationMs: durationMs > 0 ? durationMs : 300,
@@ -373,36 +353,34 @@ public partial class PlatformAgentService
 
     private static async Task<string?> AndroidPanAsync(VisualElement element, double deltaX, double deltaY, int durationMs, int steps, string label)
     {
-        var view = GetAndroidView(element);
-        if (view == null) return null;
-        if (GetAndroidTouchGeometry(view, new Point(0.5, 0.5)) is not { } geometry) return null;
-
-        var (center, _, density) = geometry;
-        // Request deltas are device-independent pixels; MotionEvent works in physical pixels.
-        var pixelX = (float)(deltaX * density);
-        var pixelY = (float)(deltaY * density);
-
-        // Start offset against the travel direction so the whole gesture stays on the view.
-        var start = new PointF(center.X - pixelX / 2f, center.Y - pixelY / 2f);
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return null;
+        // Request deltas and the surface are both device-independent; ToView converts to pixels.
+        if (Core.SyntheticTouchGeometry.ForDrag(surface.Width, surface.Height, deltaX, deltaY) is not { } drag)
+            return null;
 
         var handled = await InjectAndroidTouchAsync(
             view,
             pointerCount: 1,
-            positionsAt: t => [new PointF(start.X + pixelX * (float)t, start.Y + pixelY * (float)t)],
+            positionsAt: t => [surface.ToView(drag.StartX + drag.DeltaX * t, drag.StartY + drag.DeltaY * t)],
             durationMs: durationMs > 0 ? durationMs : 200,
             steps: steps,
             settleMs: label == "pan" ? 60 : 0);
+        if (!handled) return null;
 
-        return handled ? $"MotionEvent {label} ({deltaX:0.#}, {deltaY:0.#})" : null;
+        var detail = $"MotionEvent {label} ({drag.DeltaX:0.#}, {drag.DeltaY:0.#})";
+        // A drag longer than the view is shortened to stay on it; say so rather than claim the full distance.
+        return drag.DeltaX == deltaX && drag.DeltaY == deltaY
+            ? detail
+            : $"{detail}, shortened from ({deltaX:0.#}, {deltaY:0.#}) to stay on the view";
     }
 
     private static async Task<string?> AndroidLongPressAsync(VisualElement element, int durationMs)
     {
-        var view = GetAndroidView(element);
-        if (view == null) return null;
-        if (GetAndroidTouchGeometry(view, new Point(0.5, 0.5)) is not { } geometry) return null;
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return null;
 
-        var center = geometry.Center;
+        var center = surface.ToView(surface.Width / 2, surface.Height / 2);
         var handled = await InjectAndroidTouchAsync(
             view,
             pointerCount: 1,
@@ -416,11 +394,10 @@ public partial class PlatformAgentService
 
     private static async Task<string?> AndroidDoubleTapAsync(VisualElement element)
     {
-        var view = GetAndroidView(element);
-        if (view == null) return null;
-        if (GetAndroidTouchGeometry(view, new Point(0.5, 0.5)) is not { } geometry) return null;
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return null;
 
-        var center = geometry.Center;
+        var center = surface.ToView(surface.Width / 2, surface.Height / 2);
         Func<double, PointF[]> at = _ => [center];
 
         if (!await InjectAndroidTouchAsync(view, 1, at, 0, 0)) return null;

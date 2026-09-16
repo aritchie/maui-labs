@@ -497,12 +497,6 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("dy=60", status.Text);
     }
 
-    // The synthesised-touch cases below are UIKit-only: Android delivers real touches, which
-    // behave exactly as a finger would — including pressing a button that is dragged across.
-    private bool SupportsSyntheticTouch =>
-        Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
-        || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
-
     private static int ReadRawTouchDx(string? statusText)
     {
         var match = System.Text.RegularExpressions.Regex.Match(statusText ?? "", @"dx=(-?\d+)");
@@ -513,9 +507,9 @@ public class UiActionTests : IntegrationTestBase
     [Fact]
     public async Task Swipe_OnRawTouchView_ArrivesAsADrag()
     {
-        if (!SupportsSyntheticTouch)
+        if (!SupportsRawTouchInjection)
         {
-            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
             return;
         }
 
@@ -534,9 +528,9 @@ public class UiActionTests : IntegrationTestBase
     [Fact]
     public async Task Pan_OnRawTouchView_LongerThanTheView_IsShortenedToStayOnIt()
     {
-        if (!SupportsSyntheticTouch)
+        if (!SupportsRawTouchInjection)
         {
-            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
             return;
         }
 
@@ -559,9 +553,9 @@ public class UiActionTests : IntegrationTestBase
     [InlineData(1.0, 1.0)]
     public async Task Pinch_OnRawTouchView_FromAnEdgeOrigin_KeepsBothFingersOnTheView(double originX, double originY)
     {
-        if (!SupportsSyntheticTouch)
+        if (!SupportsRawTouchInjection)
         {
-            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
             return;
         }
 
@@ -577,6 +571,12 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("maxtouches=2", status.Text);
         Assert.Contains("scale=0.50", status.Text);
     }
+
+    // UIKit-only: Android delivers real touches to the named view, which behave exactly as a
+    // finger would — including pressing a button that is dragged across.
+    private bool SupportsSyntheticTouch =>
+        Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+        || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
 
     [Fact]
     public async Task Pan_OnAnOrdinaryButton_NeverDeliversSyntheticTouches()

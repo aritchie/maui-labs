@@ -78,6 +78,32 @@ internal sealed class DesignEditingTestHarness : IDisposable
         throw new InvalidOperationException($"Could not find element with automation ID '{automationId}'.");
     }
 
+    /// <summary>
+    /// Polls <paramref name="condition"/> until it holds. <paramref name="background"/> is the work expected
+    /// to make it hold: when it finishes first, it is awaited so its own failure surfaces instead of a
+    /// timeout that says nothing about why.
+    /// </summary>
+    public static async Task WaitForAsync(Func<bool> condition, string description, Task? background = null)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!condition())
+        {
+            if (background is { IsCompleted: true })
+            {
+                await background;
+                if (!condition())
+                    throw new InvalidOperationException($"Waited for {description}, but the work that should have caused it finished first.");
+
+                return;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+                throw new TimeoutException($"Timed out after 10 seconds waiting for {description}.");
+
+            await Task.Delay(20);
+        }
+    }
+
     public async Task<ClientWebSocket> SubscribeUiEventsAsync(params string[] events)
     {
         var socket = new ClientWebSocket();

@@ -306,9 +306,7 @@ public class DesignEditingTests
 
         using var cancellation = new CancellationTokenSource();
         var pick = harness.Client.PickElementAsync(TimeSpan.FromMinutes(1), cancellation.Token);
-        for (var i = 0; i < 50 && !overlay.IsPickMode; i++)
-            await Task.Delay(20);
-        Assert.True(overlay.IsPickMode);
+        await DesignEditingTestHarness.WaitForAsync(() => overlay.IsPickMode, "pick mode to turn on", pick);
 
         await cancellation.CancelAsync();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pick);

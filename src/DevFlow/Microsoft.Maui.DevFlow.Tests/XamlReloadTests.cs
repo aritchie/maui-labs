@@ -143,6 +143,82 @@ public class XamlReloadTests : IDisposable
         Assert.Equal(expectedLine, title.SourceLine);
     }
 
+    [Fact]
+    public async Task ReloadXaml_FailedInflation_LeavesTheLiveViewAsItWas()
+    {
+        var view = new ReloadableTestView();
+        using var harness = await DesignEditingTestHarness.CreateAsync(view);
+        Assert.True((await harness.Client.ReloadXamlAsync(Xaml("Before"))).Success);
+        var content = view.Content;
+
+        var result = await harness.Client.ReloadXamlAsync(Xaml("After", "<NotARealControl />"));
+
+        Assert.False(result.Success);
+        Assert.Same(content, view.Content);
+        Assert.Equal("Before", view.Title!.Text);
+        Assert.Single(view.Resources);
+        Assert.Same(view.Title, view.FindByName("Title"));
+    }
+
+    [Fact]
+    public async Task ReloadXaml_ClearsSingleContent_WhenTheDocumentNoLongerDeclaresAny()
+    {
+        var view = new ReloadableTestView();
+        using var harness = await DesignEditingTestHarness.CreateAsync(view);
+        Assert.True((await harness.Client.ReloadXamlAsync(Xaml("Before"))).Success);
+
+        var empty = $"""
+            <ContentView xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+                         xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+                         x:Class="{ClassName}" />
+            """;
+        var result = await harness.Client.ReloadXamlAsync(empty);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Null(view.Content);
+    }
+
+    [Fact]
+    public async Task ReloadXaml_ClearsGeneratedField_WhenTheDocumentNoLongerDeclaresTheName()
+    {
+        var view = new ReloadableTestView();
+        using var harness = await DesignEditingTestHarness.CreateAsync(view);
+        Assert.True((await harness.Client.ReloadXamlAsync(Xaml("Named"))).Success);
+        Assert.NotNull(view.Title);
+
+        var result = await harness.Client.ReloadXamlAsync(Xaml("Anonymous").Replace("x:Name=\"Title\" ", "", StringComparison.Ordinal));
+
+        Assert.True(result.Success, result.Error);
+        Assert.Null(view.Title);
+    }
+
+    [Fact]
+    public async Task ReloadXaml_StaleCaptureEpoch_IsRejected()
+    {
+        var view = new ReloadableTestView { AutomationId = "captured-view" };
+        using var harness = await DesignEditingTestHarness.CreateAsync(view);
+        var captured = Flatten(await harness.Client.GetTreeAsync()).First(e => e.AutomationId == "captured-view");
+
+        var first = await harness.Client.ReloadXamlAsync(
+            Xaml("One"),
+            elementId: captured.Id,
+            captureEpoch: captured.CaptureEpoch,
+            registryGeneration: captured.RegistryGeneration);
+        Assert.True(first.Success, first.Error);
+
+        // that reload changed the tree, so replaying the same epoch has to be refused
+        var stale = await harness.Client.ReloadXamlAsync(
+            Xaml("Two"),
+            elementId: captured.Id,
+            captureEpoch: captured.CaptureEpoch,
+            registryGeneration: captured.RegistryGeneration);
+
+        Assert.False(stale.Success);
+        Assert.Equal(409, stale.StatusCode);
+        Assert.Equal("stale-capture-epoch", stale.Reason);
+        Assert.Equal("One", view.Title!.Text);
+    }
+
     static IEnumerable<Driver.ElementInfo> Flatten(IEnumerable<Driver.ElementInfo> elements)
         => elements.SelectMany(e => new[] { e }.Concat(Flatten(e.Children ?? [])));
 }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Maui.Cli.DevFlow.Mcp;
 using Microsoft.Maui.Cli.DevFlow.Mcp.Tools;
 using Microsoft.Maui.Cli.UnitTests.Fixtures;
@@ -50,6 +51,26 @@ public class DevFlowMcpEditingToolsTests
 
         await Assert.ThrowsAsync<McpException>(() => EditingTools.ReloadXaml(session));
         await Assert.ThrowsAsync<McpException>(() => EditingTools.ReloadXaml(session, xaml: "<a/>", filePath: "b.xaml"));
+    }
+
+    [Fact]
+    public async Task ReloadXaml_FromFile_ForwardsThePathAsSourceFile()
+    {
+        await using var server = new MockAgentServer();
+        await server.StartAsync();
+        var file = Path.Combine(Path.GetTempPath(), $"mcp-reload-{Guid.NewGuid():N}.xaml");
+        await File.WriteAllTextAsync(file, "<ContentPage x:Class=\"App.MainPage\" />");
+        try
+        {
+            await EditingTools.ReloadXaml(CreateSession(server.Port), filePath: file, agentPort: server.Port);
+
+            var request = Assert.Single(server.RecordedRequests, r => r.Path == "/api/v1/ui/xaml/reload");
+            Assert.Equal(file, JsonDocument.Parse(request.Body!).RootElement.GetProperty("sourceFile").GetString());
+        }
+        finally
+        {
+            File.Delete(file);
+        }
     }
 
     [Fact]

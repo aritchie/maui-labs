@@ -57,35 +57,79 @@ internal static class XamlReloader
     {
         xaml = Normalize(xaml);
 
-        // Resources, names and collections are additive during inflation - start them from empty or
-        // the second load throws "key already exists" / "name already registered" or duplicates.
+        // Inflation appends to what is already there, so the root has to start empty - otherwise the
+        // load throws "key already exists" / "name already registered", or duplicates children. The
+        // undo actions put the old state back when inflation fails, so invalid XAML leaves the
+        // running view as it was instead of gutted.
+        var undo = new List<Action>();
+
         if (root is VisualElement visual)
         {
+            var resources = visual.Resources;
+            undo.Add(() => visual.Resources = resources);
             visual.Resources = new ResourceDictionary();
-            visual.Behaviors.Clear();
-            visual.Triggers.Clear();
+
+            Clear(visual.Behaviors, undo);
+            Clear(visual.Triggers, undo);
         }
         if (root is View view)
-            view.GestureRecognizers.Clear();
+            Clear(view.GestureRecognizers, undo);
         if (root is Page page)
-            page.ToolbarItems.Clear();
+            Clear(page.ToolbarItems, undo);
         if (root is Layout layout)
-            layout.Children.Clear();
+            Clear(layout.Children, undo);
         if (root is Shell shell)
-            shell.Items.Clear();
+            Clear(shell.Items, undo);
         if (root is MultiPage<Page> multi)
-            multi.Children.Clear();
+            Clear(multi.Children, undo);
+
+        // A single-content root (ContentPage, ContentView, Border, ScrollView, ...) would otherwise
+        // keep its old child when the new XAML no longer declares one.
+        if (LiveTreeEditor.GetContentProperty(root) is { } contentProperty)
+        {
+            var content = contentProperty.GetValue(root);
+            undo.Add(() => contentProperty.SetValue(root, content));
+            contentProperty.SetValue(root, null);
+        }
 
         // NameScope.SetNameScope is a no-op once a scope exists, so set the attached property directly.
+        var nameScope = root.GetValue(NameScope.NameScopeProperty);
+        undo.Add(() => root.SetValue(NameScope.NameScopeProperty, nameScope));
         root.SetValue(NameScope.NameScopeProperty, new NameScope());
-        root.LoadFromXaml(xaml);
+
+        try
+        {
+            root.LoadFromXaml(xaml);
+        }
+        catch
+        {
+            for (var i = undo.Count - 1; i >= 0; i--)
+                undo[i]();
+            throw;
+        }
 
         // Re-point the generated x:Name fields so code-behind keeps working against the new elements.
+        // A name the new document no longer declares is cleared rather than left pointing at the
+        // element that was just detached.
         foreach (var field in GetGeneratedFields(root.GetType()))
         {
-            if (root.FindByName(field.Name) is { } named && field.FieldType.IsInstanceOfType(named))
-                field.SetValue(root, named);
+            var named = root.FindByName(field.Name);
+            field.SetValue(root, named is not null && field.FieldType.IsInstanceOfType(named) ? named : null);
         }
+    }
+
+    // Empties a collection and records how to put its items back, dropping anything a failed
+    // inflation appended in the meantime.
+    static void Clear<T>(IList<T> collection, List<Action> undo)
+    {
+        var saved = collection.ToArray();
+        undo.Add(() =>
+        {
+            collection.Clear();
+            foreach (var item in saved)
+                collection.Add(item);
+        });
+        collection.Clear();
     }
 
     static void CollectPages(Page page, string className, HashSet<Element> found)

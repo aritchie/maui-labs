@@ -194,8 +194,8 @@ public class DesignEditingTests
 
         Assert.False(result.Success);
         Assert.Equal("content-occupied", result.Reason);
-        Assert.Equal(2, source.Children.Count);
-        Assert.Contains(source.Children, v => ((VisualElement)v).AutomationId == "a");
+        // back where it was, index included - not appended to the end
+        Assert.Equal(["a", "b"], source.Children.Cast<VisualElement>().Select(v => v.AutomationId));
     }
 
     [Fact]
@@ -264,8 +264,8 @@ public class DesignEditingTests
         var small = new Label { AutomationId = "picked-label", WidthRequest = 10, HeightRequest = 10 };
         var stack = new VerticalStackLayout { AutomationId = "pick-stack" };
         stack.Children.Add(small);
-        using var harness = await DesignEditingTestHarness.CreateAsync(stack);
-        var labelId = await harness.GetElementIdAsync("picked-label");
+        using var harness = await DesignEditingTestHarness.CreateWithWindowAsync(stack);
+        await harness.GetElementIdAsync("picked-label");
         using var socket = await harness.SubscribeUiEventsAsync("elementPicked");
 
         Assert.True((await harness.Client.SetPickModeAsync(true)).Success);
@@ -280,6 +280,39 @@ public class DesignEditingTests
         var pickEvent = await DesignEditingTestHarness.ReceiveEventAsync(socket, "elementPicked");
         Assert.Equal("Label", pickEvent.GetProperty("elementType").GetString());
         Assert.False(string.IsNullOrEmpty(pickEvent.GetProperty("elementId").GetString()));
+    }
+
+    [Fact]
+    public async Task PickMode_WithoutADiagnosticsOverlay_Returns501_RatherThanWaitingForATapThatCannotArrive()
+    {
+        // no window, so no IVisualDiagnosticsOverlay to intercept taps
+        using var harness = await DesignEditingTestHarness.CreateAsync(Stack("no-overlay-stack"));
+
+        var result = await harness.Client.SetPickModeAsync(true);
+
+        Assert.False(result.Success);
+        Assert.Equal(501, result.StatusCode);
+        Assert.False(harness.Service.GetSelectionOverlay().IsPickMode);
+
+        // turning it off is still a no-op success: there is nothing to restore
+        Assert.True((await harness.Client.SetPickModeAsync(false)).Success);
+    }
+
+    [Fact]
+    public async Task PickElement_TurnsPickModeOffAgain_WhenTheCallerCancels()
+    {
+        using var harness = await DesignEditingTestHarness.CreateWithWindowAsync(Stack("cancel-stack"));
+        var overlay = harness.Service.GetSelectionOverlay();
+
+        using var cancellation = new CancellationTokenSource();
+        var pick = harness.Client.PickElementAsync(TimeSpan.FromMinutes(1), cancellation.Token);
+        for (var i = 0; i < 50 && !overlay.IsPickMode; i++)
+            await Task.Delay(20);
+        Assert.True(overlay.IsPickMode);
+
+        await cancellation.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pick);
+        Assert.False(overlay.IsPickMode);
     }
 
     [Fact]

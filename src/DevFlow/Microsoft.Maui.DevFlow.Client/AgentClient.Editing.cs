@@ -89,7 +89,9 @@ public partial class AgentClient
         string xaml,
         string? className = null,
         string? elementId = null,
-        string? sourceFile = null)
+        string? sourceFile = null,
+        long? captureEpoch = null,
+        long? registryGeneration = null)
     {
         var payload = new JsonObject { ["xaml"] = xaml };
         if (className is not null)
@@ -98,6 +100,7 @@ public partial class AgentClient
             payload["elementId"] = elementId;
         if (sourceFile is not null)
             payload["sourceFile"] = sourceFile;
+        AddCaptureMetadata(payload, captureEpoch, registryGeneration);
 
         var (statusCode, body, failure) = await SendForBodyAsync(HttpMethod.Post, $"{UiApi}/xaml/reload", payload);
         if (failure is not null)
@@ -176,8 +179,20 @@ public partial class AgentClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            await SetPickModeAsync(false);
             return null;
+        }
+        finally
+        {
+            // Restore normal tap behaviour whatever happened - the timeout, the caller cancelling,
+            // or the socket failing - so the app is never left stuck in pick mode.
+            try
+            {
+                await SetPickModeAsync(false);
+            }
+            catch (Exception)
+            {
+                // best effort: the original outcome is what the caller cares about
+            }
         }
     }
 

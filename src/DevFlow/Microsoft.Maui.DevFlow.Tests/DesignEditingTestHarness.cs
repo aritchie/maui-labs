@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Maui;
@@ -28,9 +29,29 @@ internal sealed class DesignEditingTestHarness : IDisposable
         App = app;
     }
 
-    public static async Task<DesignEditingTestHarness> CreateAsync(params View[] views)
+    public static Task<DesignEditingTestHarness> CreateAsync(params View[] views)
+        => StartAsync(new TestApplication(views));
+
+    /// <summary>
+    /// An agent bound to an app with a real window hosting <paramref name="views"/>, so each
+    /// element's <c>Window</c> and the window's <see cref="IVisualDiagnosticsOverlay"/> exist the
+    /// way they do in a running app. Highlight and pick mode need the overlay.
+    /// </summary>
+    public static Task<DesignEditingTestHarness> CreateWithWindowAsync(params View[] views)
     {
-        var app = new TestApplication(views);
+        var root = new VerticalStackLayout();
+        foreach (var view in views)
+            root.Children.Add(view);
+
+        var app = new Application();
+        typeof(Application)
+            .GetMethod("AddWindow", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .Invoke(app, [new Window(new ContentPage { Content = root })]);
+        return StartAsync(app);
+    }
+
+    private static async Task<DesignEditingTestHarness> StartAsync(Application app)
+    {
         var service = new MauiDevFlowAgentService(new AgentOptions { Port = GetFreePort() });
         var client = new AgentClient("localhost", service.Port);
 

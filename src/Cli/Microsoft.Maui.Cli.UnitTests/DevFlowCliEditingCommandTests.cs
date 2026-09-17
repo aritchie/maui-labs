@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Maui.Cli.UnitTests.Fixtures;
 using Xunit;
 
@@ -100,6 +101,8 @@ public class DevFlowCliEditingCommandTests
             Assert.Equal(0, result.ExitCode);
             var request = Assert.Single(server.RecordedRequests, r => r.Path == "/api/v1/ui/xaml/reload");
             Assert.Contains("App.MainPage", request.Body);
+            // the agent needs the path to build a source map when it has no build-time one
+            Assert.Equal(file, JsonDocument.Parse(request.Body!).RootElement.GetProperty("sourceFile").GetString());
             var output = result.ParseJsonOutput();
             Assert.Equal(1, output.GetProperty("reloaded").GetInt32());
             Assert.Equal("abc123", output.GetProperty("sourceHash").GetString());

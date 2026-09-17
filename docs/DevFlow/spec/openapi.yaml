@@ -1065,7 +1065,9 @@ paths:
         Re-inflates every live instance of a page or view (or one instance) from new XAML text, and
         replaces the agent's source map for the type so sourceLine and sourceHash follow the text
         that is now running. Works without an IDE; it can run alongside IDE XAML Hot Reload, where
-        the last change applied wins.
+        the last change applied wins. A reload targeting elementId may carry capture metadata, which
+        is validated as it is for the structural edits. XAML that fails to inflate leaves the live
+        view as it was.
       requestBody:
         required: true
         content:

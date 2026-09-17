@@ -131,6 +131,8 @@ internal static class LiveTreeEditor
         if (newParent is not Layout && GetContentProperty(newParent) is null)
             throw new LiveTreeEditException($"{newParent.GetType().Name} cannot hold child views", "not-a-container");
 
+        // remember where it was so a failed insert restores the original order, not just the parent
+        var oldIndex = IndexInParent(view);
         var oldParent = Detach(view);
         try
         {
@@ -139,7 +141,7 @@ internal static class LiveTreeEditor
         catch
         {
             // put it back rather than leave the element orphaned
-            Insert(oldParent, view, null);
+            Insert(oldParent, view, oldIndex);
             throw;
         }
     }
@@ -148,7 +150,8 @@ internal static class LiveTreeEditor
     public static int? IndexInParent(View view)
         => view.Parent is Layout layout ? layout.Children.IndexOf(view) : null;
 
-    static PropertyInfo? GetContentProperty(Element parent)
+    /// <summary>The parent's <see cref="ContentPropertyAttribute"/> property when it holds a single view.</summary>
+    internal static PropertyInfo? GetContentProperty(Element parent)
     {
         for (var type = parent.GetType(); type is not null; type = type.BaseType)
         {

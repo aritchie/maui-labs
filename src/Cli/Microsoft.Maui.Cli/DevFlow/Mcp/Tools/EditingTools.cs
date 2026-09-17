@@ -70,7 +70,7 @@ public sealed class EditingTools
 		}
 
 		using var agent = await session.GetAgentClientAsync(agentPort);
-		var result = await agent.ReloadXamlAsync(xaml!, elementId: elementId);
+		var result = await agent.ReloadXamlAsync(xaml!, elementId: elementId, sourceFile: filePath);
 		if (result.Success)
 			return $"Reloaded {result.Reloaded} live instance(s) of {result.ClassName}.";
 

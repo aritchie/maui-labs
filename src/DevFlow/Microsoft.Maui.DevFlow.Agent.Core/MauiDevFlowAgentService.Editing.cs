@@ -175,9 +175,12 @@ public partial class MauiDevFlowAgentService
         var body = request.BodyAs<XamlReloadRequest>();
         if (string.IsNullOrWhiteSpace(body?.Xaml))
             return HttpResponse.Error("xaml is required", reason: "invalid-xaml");
+        if (await PrepareUiMutationAsync(request, body, body.ElementId) is { } staleCapture)
+            return staleCapture;
 
         var startedAtUtc = DateTime.UtcNow;
-        var result = await DispatchAsync(() => ReloadXaml(body));
+        var reservedCapture = GetReservedCapture(request);
+        var result = await DispatchAsync(() => ReloadXaml(body, reservedCapture));
 
         PublishUiOperationSpan("action.reload-xaml", startedAtUtc, result.Response is null, null, result.ClassName);
         if (result.Response is { } failure)
@@ -235,11 +238,13 @@ public partial class MauiDevFlowAgentService
         if (_app == null) return HttpResponse.Error("Agent not bound to app");
 
         var body = request.BodyAs<PickModeRequest>() ?? new PickModeRequest();
-        await DispatchAsync(() =>
-        {
-            GetSelectionOverlay().SetPickMode(_app, body.Enabled);
-            return true;
-        });
+        var installed = await DispatchAsync(() => GetSelectionOverlay().SetPickMode(_app, body.Enabled));
+
+        // Turning pick mode on without an overlay would report success while taps kept going to the
+        // app, leaving the client waiting for a pick that can never arrive.
+        if (!installed && body.Enabled)
+            return NotSupported("ui.highlight", "The app's windows have no visual diagnostics overlay.");
+
         return HttpResponse.Json(new { success = true, enabled = body.Enabled });
     }
 
@@ -277,7 +282,7 @@ public partial class MauiDevFlowAgentService
             => new(response, [], className, null);
     }
 
-    private ReloadOutcome ReloadXaml(XamlReloadRequest body)
+    private ReloadOutcome ReloadXaml(XamlReloadRequest body, UiCaptureContext capture)
     {
         string? className;
         try
@@ -292,7 +297,7 @@ public partial class MauiDevFlowAgentService
         List<Element> targets;
         if (!string.IsNullOrWhiteSpace(body.ElementId))
         {
-            if (_treeWalker.GetElementById(body.ElementId, _app) is not Element target)
+            if (ResolveCapturedElement(capture, body.ElementId, id => _treeWalker.GetElementById(id, _app)) is not Element target)
                 return ReloadOutcome.Failed(HttpResponse.Error($"Element '{body.ElementId}' not found", 404, "not-found"), className);
             if (className != null && target.GetType().FullName != className)
             {
@@ -314,6 +319,8 @@ public partial class MauiDevFlowAgentService
 
         try
         {
+            // Reload restores a target it could not inflate, so invalid XAML fails on the first one
+            // and leaves the rest untouched.
             foreach (var target in targets)
                 XamlReloader.Reload(target, body.Xaml!);
         }

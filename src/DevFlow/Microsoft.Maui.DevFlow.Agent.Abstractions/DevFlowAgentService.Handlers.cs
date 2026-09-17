@@ -2939,7 +2939,7 @@ public class MoveElementRequest : CaptureBoundRequest
     public int? Index { get; set; }
 }
 
-public class XamlReloadRequest
+public class XamlReloadRequest : CaptureBoundRequest
 {
     /// <summary>The full XAML document for a page or view, including its <c>x:Class</c>.</summary>
     public string? Xaml { get; set; }

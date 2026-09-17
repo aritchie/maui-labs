@@ -53,9 +53,12 @@ internal sealed class SelectionOverlay
             Highlight(app, null);
     }
 
-    public void SetPickMode(Application app, bool enabled)
+    /// <summary>Turns pick mode on or off in every window.</summary>
+    /// <returns>False when no window has a diagnostics overlay, so taps cannot be intercepted.</returns>
+    public bool SetPickMode(Application app, bool enabled)
     {
         IsPickMode = enabled;
+        var installed = false;
         foreach (var overlay in Overlays(app))
         {
             if (_hooked.Add(overlay))
@@ -63,7 +66,12 @@ internal sealed class SelectionOverlay
 
             overlay.DisableUITouchEventPassthrough = enabled;
             overlay.EnableDrawableTouchHandling = enabled;
+            installed = true;
         }
+
+        if (!installed)
+            IsPickMode = false;
+        return installed;
     }
 
     /// <summary>Handles a tap on the overlay. Internal so tests can drive it without a platform.</summary>

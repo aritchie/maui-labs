@@ -3925,7 +3925,10 @@ public class DevFlowCommands
             }
 
             using var client = await CreateAgentClientAsync(host, port);
-            var result = await client.ReloadXamlAsync(await File.ReadAllTextAsync(file), elementId: elementId);
+            var result = await client.ReloadXamlAsync(
+                await File.ReadAllTextAsync(file),
+                elementId: elementId,
+                sourceFile: file);
             if (!result.Success)
             {
                 var message = result.Error ?? "XAML reload failed";

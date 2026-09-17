@@ -139,9 +139,11 @@
             "not-removable",
             "native-element-not-supported",
             "invalid-property",
+            "native-property-not-supported",
             "class-mismatch",
             "reload-failed",
-            "not-found"
+            "not-found",
+            "capture-epoch-required"
           ]
         },
         "details": {
@@ -160,7 +162,7 @@
     },
     "XamlReloadRequest": {
       "type": "object",
-      "description": "Re-inflate live pages or views from XAML text. Resources, behaviors, triggers, gesture recognizers, toolbar items, layout children, Shell items and multi-page children on the root are reset before inflation; generated x:Name fields are re-pointed at the new elements.",
+      "description": "Re-inflate live pages or views from XAML text. Resources, behaviors, triggers, gesture recognizers, toolbar items, single content, layout children, Shell items and multi-page children on the root are reset before inflation and restored when inflation fails; generated x:Name fields are re-pointed at the new elements, and cleared for names the document no longer declares.",
       "required": ["xaml"],
       "properties": {
         "xaml": {
@@ -178,6 +180,12 @@
         "sourceFile": {
           "type": ["string", "null"],
           "description": "Project-relative path for the refreshed source map when the app has no build-time map for the type."
+        },
+        "captureEpoch": {
+          "$ref": "actions.json#/$defs/CaptureEpoch"
+        },
+        "registryGeneration": {
+          "$ref": "actions.json#/$defs/RegistryGeneration"
         }
       }
     },

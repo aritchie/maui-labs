@@ -17,6 +17,8 @@ internal static class SyntheticTouchGeometry
 
     internal readonly record struct Drag(double StartX, double StartY, double DeltaX, double DeltaY);
 
+    internal readonly record struct Tap(double X, double Y);
+
     /// <summary>
     /// Two fingers on a horizontal line through the origin. The origin is moved inwards when a
     /// full-radius pinch there would put a finger off the view. Null when the view is too small
@@ -74,6 +76,19 @@ internal static class SyntheticTouchGeometry
         var dx = deltaX * factor;
         var dy = deltaY * factor;
         return new Drag(width / 2 - dx / 2, height / 2 - dy / 2, dx, dy);
+    }
+
+    /// <summary>
+    /// A tap exactly where it was asked for. Unlike the gestures, a tap is not nudged inwards —
+    /// content on a canvas is hit-tested from this point, so moving it would tap something else.
+    /// Null when the point is not on the view: the near edges count as on it, the far edges not.
+    /// </summary>
+    internal static Tap? ForTap(double width, double height, double x, double y)
+    {
+        if (!(width > 0) || !(height > 0) || !double.IsFinite(x) || !double.IsFinite(y))
+            return null;
+
+        return x >= 0 && y >= 0 && x < width && y < height ? new Tap(x, y) : null;
     }
 
     private static bool HasRoom(double width, double height)

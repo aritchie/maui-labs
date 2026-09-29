@@ -537,7 +537,7 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
             switch (actionName)
             {
                 case "tap":
-                    response = await HandleTap(new HttpRequest { Method = "POST", Body = AgentJson.Serialize(new ActionRequest { ElementId = action.ElementId }) });
+                    response = await HandleTap(new HttpRequest { Method = "POST", Body = AgentJson.Serialize(new TapRequest { ElementId = action.ElementId, X = action.X, Y = action.Y }) });
                     break;
                 case "fill":
                     response = await HandleFill(new HttpRequest

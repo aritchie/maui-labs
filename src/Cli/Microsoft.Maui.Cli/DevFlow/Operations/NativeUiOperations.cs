@@ -65,6 +65,13 @@ internal sealed class NativeUiOperations(AgentClient client)
         return client.TapAsync(element.Id, epoch, generation);
     }
 
+    internal Task<ActionResult> TapAtAsync(ElementInfo element, double x, double y)
+    {
+        var (epoch, generation) = GetCaptureMetadata(element);
+
+        return client.TapResultAsync(element.Id, x, y, epoch, generation);
+    }
+
     internal Task<bool> FillAsync(ElementInfo element, string text)
     {
         var (epoch, generation) = GetCaptureMetadata(element);

@@ -134,4 +134,37 @@ public class SyntheticTouchGeometryTests
     [InlineData(Width, Height, double.NaN)]
     public void Rotation_IsRefusedWhenItCannotBeDelivered(double width, double height, double originX)
         => Assert.Null(SyntheticTouchGeometry.ForRotation(width, height, originX, 0.5));
+
+    [Theory]
+    [InlineData(150, 70)]
+    [InlineData(0, 0)]
+    [InlineData(0.5, Height - 0.5)]
+    [InlineData(Width - 0.001, 1)]
+    public void Tap_OnTheView_IsDeliveredExactlyWhereAsked(double x, double y)
+    {
+        // Unlike the gestures, a tap is never nudged inwards: a canvas hit-tests its drawn
+        // content from this point, so moving it would tap something else.
+        var tap = SyntheticTouchGeometry.ForTap(Width, Height, x, y);
+
+        Assert.NotNull(tap);
+        Assert.Equal(x, tap.Value.X);
+        Assert.Equal(y, tap.Value.Y);
+    }
+
+    [Theory]
+    [InlineData(Width, 10)]
+    [InlineData(10, Height)]
+    [InlineData(-0.5, 10)]
+    [InlineData(10, -0.5)]
+    [InlineData(double.NaN, 10)]
+    [InlineData(10, double.PositiveInfinity)]
+    public void Tap_OffTheView_IsRefused(double x, double y)
+        => Assert.Null(SyntheticTouchGeometry.ForTap(Width, Height, x, y));
+
+    [Theory]
+    [InlineData(0, Height)]
+    [InlineData(Width, 0)]
+    [InlineData(double.NaN, Height)]
+    public void Tap_OnAViewWithNoArea_IsRefused(double width, double height)
+        => Assert.Null(SyntheticTouchGeometry.ForTap(width, height, 0, 0));
 }

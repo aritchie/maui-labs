@@ -191,11 +191,31 @@ Override virtual methods from `Agent.Abstractions/DevFlowAgentService.cs`:
      receive synthesised `UITouch` sequences. This opt-in uses private UIKit ivars; ordinary
      controls, scroll views, and recognizer-backed views are excluded. The status capability
      `syntheticTouch` reports whether the tier is enabled on that backend. `SKCanvasView` is not
-     eligible because its touch handling is recognizer-backed.
+     eligible for these gestures because its touch handling is recognizer-backed; a tap at a
+     point reaches it (below).
    - **Windows** — `ScrollViewer.ChangeView`. Input injection needs the restricted
      `inputInjectionBrokered` capability and is unusable from a normal app package.
    - **macOS AppKit** — `NSScrollView` magnification and content offset.
    - **GTK** — tier 1 only.
+
+**Tap at a point.** `POST /api/v1/ui/actions/tap` with `x`/`y` (device-independent units from the
+element's top-left) delivers a real touch at that point instead of invoking the element. It exists
+for content a canvas draws and hit-tests itself — SkiaSharp's `SKCanvasView`, `GraphicsView`,
+Syncfusion's charts and other Microsoft.Maui.Graphics controls — which has no element ID. Core
+(`HandlePointTapAsync`) validates the point against the element's bounds and never falls back to
+the element tap; platforms override `TryNativePointTapAsync`.
+   - **Android** — a `MotionEvent` down/up at the point, sent to the element's view like the
+     gestures above; the point must be in the view's visible rect.
+   - **iOS / Mac Catalyst** — requires `EnableSyntheticTouch`. The window hit-tests the point,
+     which must land on the element or inside it (controls and scroll views are refused — tap them
+     by ID). The synthesised `UITouch` is then fed straight to the gesture recognizers on the hit
+     view and its ancestors up to the element (`AppleTouchInjector.TapRecognizersAsync`), after
+     asking each delegate's `gestureRecognizer:shouldReceiveTouch:`; a recognizer-less view the
+     raw-touch policy accepts gets it through `touchesBegan:` as for gestures. Recognizers a lone
+     one-finger tap cannot complete (multi-tap, multi-touch, pinch, rotation) are skipped: UIKit
+     fails them on a timer its gesture environment only runs for real touches, so fed this tap
+     they would hold it and turn the next tap into a stale double tap. `setState:` and `reset`
+     do not clear that state.
 
 Gesture directions describe finger travel, not content travel. An `up` swipe moves the pointer
 upward; a scroll fallback inverts that vector so scrollable content moves downward consistently

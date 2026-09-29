@@ -372,6 +372,75 @@ internal static class AppleTouchInjector
         }
     }
 
+    [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    private static extern bool SendBool(IntPtr receiver, IntPtr selector, IntPtr arg1, IntPtr arg2);
+
+    /// <summary>
+    /// A single tap delivered to gesture recognizers rather than to a view. Canvases such as
+    /// SkiaSharp's SKCanvasView and Syncfusion's drawn controls take input only through
+    /// recognizers, which UIKit feeds from the touches it routes to the view; a touch handed to
+    /// the view directly never reaches them. Each recognizer is given the touch the way UIKit's
+    /// gesture environment would — its delegate is asked first, then it sees the touch begin and
+    /// end — so a recognizer that reads <c>locationInView:</c> gets the tapped point.
+    /// </summary>
+    internal static async Task<IReadOnlyList<UIGestureRecognizer>?> TapRecognizersAsync(
+        UIView target,
+        IReadOnlyList<UIGestureRecognizer> recognizers,
+        CGPoint locationInWindow,
+        int holdMs)
+    {
+        var window = target.Window;
+        if (window == null)
+            return null;
+
+        using var touch = AppleSyntheticTouch.Create(window, target, locationInWindow);
+        if (touch == null)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                "[Microsoft.Maui.DevFlow] Synthetic UITouch could not be assembled on this OS version.");
+            return null;
+        }
+
+        using var set = new NSSet(touch.Touch);
+        using var touchEvent = new SyntheticTouchEvent(set);
+        var shouldReceive = (IntPtr)Selector.GetHandle("gestureRecognizer:shouldReceiveTouch:");
+        var receiving = new List<UIGestureRecognizer>(recognizers.Count);
+
+        try
+        {
+            foreach (var recognizer in recognizers)
+            {
+                // A delegate that declines the touch keeps the recognizer out of it, as it would
+                // for a real finger — Syncfusion's scroll recognizer filters touches this way.
+                var recognizerDelegate = recognizer.WeakDelegate;
+                if (recognizerDelegate != null
+                    && recognizerDelegate.RespondsToSelector(new Selector("gestureRecognizer:shouldReceiveTouch:"))
+                    && !SendBool((IntPtr)recognizerDelegate.Handle, shouldReceive, (IntPtr)recognizer.Handle, (IntPtr)touch.Touch.Handle))
+                    continue;
+
+                receiving.Add(recognizer);
+            }
+
+            foreach (var recognizer in receiving)
+                recognizer.TouchesBegan(set, touchEvent);
+
+            if (holdMs > 0)
+                await Task.Delay(holdMs);
+
+            touch.End();
+            foreach (var recognizer in receiving)
+                recognizer.TouchesEnded(set, touchEvent);
+
+            return receiving;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[Microsoft.Maui.DevFlow] Synthetic recognizer tap failed: {ex.GetBaseException().Message}");
+            return null;
+        }
+    }
 }
 
 /// <summary>

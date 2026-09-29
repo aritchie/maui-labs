@@ -117,6 +117,17 @@ public partial class PlatformAgentService
 #endif
     }
 
+    protected override async Task<PointTapResult> TryNativePointTapAsync(VisualElement element, Point point)
+    {
+#if ANDROID
+        return await AndroidPointTapAsync(element, point);
+#elif IOS || MACCATALYST
+        return await ApplePointTapAsync(element, point, RawTouchPolicy);
+#else
+        return await base.TryNativePointTapAsync(element, point);
+#endif
+    }
+
 #if ANDROID
     // MotionEvent.ACTION_POINTER_INDEX_SHIFT — the pointer index is packed into the
     // high bits of the action for ACTION_POINTER_DOWN/UP.
@@ -147,6 +158,18 @@ public partial class PlatformAgentService
         float Left, float Top, float Density, double Width, double Height)
     {
         internal PointF ToView(double x, double y) => new(Left + (float)(x * Density), Top + (float)(y * Density));
+
+        /// <summary>
+        /// A point given from the view's own top-left rather than the visible rect's, in the
+        /// view's pixels — or null when that part of the view is scrolled or clipped out of sight.
+        /// </summary>
+        internal PointF? FromViewOrigin(double x, double y)
+        {
+            float px = (float)(x * Density), py = (float)(y * Density);
+            return px >= Left && py >= Top && px < Left + Width * Density && py < Top + Height * Density
+                ? new PointF(px, py)
+                : null;
+        }
     }
 
     /// <summary>
@@ -390,6 +413,22 @@ public partial class PlatformAgentService
             holdMs: durationMs);
 
         return handled ? $"MotionEvent long press ({durationMs}ms)" : null;
+    }
+
+    private static async Task<PointTapResult> AndroidPointTapAsync(VisualElement element, Point point)
+    {
+        if (GetAndroidView(element) is not { } view || GetAndroidTouchSurface(view) is not { } surface)
+            return PointTapResult.Failed($"{element.GetType().Name} is not laid out on screen");
+        if (surface.FromViewOrigin(point.X, point.Y) is not { } at)
+            return PointTapResult.Failed(
+                $"Point ({point.X:0.#}, {point.Y:0.#}) is not in the visible part of {element.GetType().Name}");
+
+        // Held briefly, as a finger is; a zero-length press reads as noise to some detectors.
+        var handled = await InjectAndroidTouchAsync(view, 1, _ => [at], 0, 0, holdMs: 50);
+        return handled
+            ? PointTapResult.Delivered($"MotionEvent tap on {view.GetType().Name}")
+            : PointTapResult.Failed(
+                $"{view.GetType().Name} did not take the touch at ({point.X:0.#}, {point.Y:0.#}); nothing there handles touches");
     }
 
     private static async Task<string?> AndroidDoubleTapAsync(VisualElement element)
@@ -849,6 +888,103 @@ public partial class PlatformAgentService
         await Task.Delay(durationMs);
         TrySetState(recognizer, UIGestureRecognizerState.Ended);
         return $"UILongPressGestureRecognizer ({durationMs}ms)";
+    }
+
+    /// <summary>
+    /// A tap at a point, for content a canvas draws and hit-tests itself. The touch goes where a
+    /// finger at that point would: the view the window hit-tests there, which must be the element
+    /// or inside it. When that view or its ancestors up to the element carry gesture recognizers
+    /// — SkiaSharp's SKTouchHandler, Syncfusion's tap and touch recognizers — the tap is delivered
+    /// to them; a raw-touch view the policy accepts, such as GraphicsView, takes it directly.
+    /// </summary>
+    private static async Task<PointTapResult> ApplePointTapAsync(
+        VisualElement element, Point point, AppleRawTouchPolicy? policy)
+    {
+        if (policy == null)
+            return PointTapResult.Failed(
+                "Tap at a point needs AgentOptions.EnableSyntheticTouch on iOS and Mac Catalyst");
+
+        var view = GetAppleView(element);
+        if (view?.Window is not { } window)
+            return PointTapResult.Failed($"{element.GetType().Name} is not in a window");
+
+        var at = ToWindow(view, point.X, point.Y);
+        var hit = window.HitTest(at, null);
+        if (hit == null || !(ReferenceEquals(hit, view) || hit.IsDescendantOfView(view)))
+            return PointTapResult.Failed(
+                $"Point ({point.X:0.#}, {point.Y:0.#}) on {element.GetType().Name} is covered by {hit?.GetType().Name ?? "nothing"}");
+
+        // Controls act from their own touch tracking and scroll views scroll from it; both are
+        // reached through the element tap, which invokes them properly.
+        if (hit is UIControl or UIScrollView)
+            return PointTapResult.Failed(
+                $"Point ({point.X:0.#}, {point.Y:0.#}) lands on a {hit.GetType().Name}; tap that element by its id instead");
+
+        var recognizers = CollectTapRecognizers(hit, view);
+        if (recognizers.Count > 0)
+        {
+            var received = await AppleTouchInjector.TapRecognizersAsync(hit, recognizers, at, holdMs: 50);
+            if (received == null)
+                return PointTapResult.Failed("A synthetic UITouch could not be delivered on this OS version");
+            if (received.Count == 0)
+                return PointTapResult.Failed($"Every recognizer on {hit.GetType().Name} declined the touch");
+
+            var recognized = received
+                .Where(r => r.State is UIGestureRecognizerState.Ended or UIGestureRecognizerState.Began)
+                .Select(r => r.GetType().Name)
+                .Distinct()
+                .ToList();
+
+            var via = recognized.Count > 0
+                ? $"recognized by {string.Join(", ", recognized)}"
+                : $"delivered to {string.Join(", ", received.Select(r => r.GetType().Name).Distinct())}";
+            return PointTapResult.Delivered($"Synthetic UITouch tap on {hit.GetType().Name}, {via}");
+        }
+
+        if (policy.Accepts(hit)
+            && await AppleTouchInjector.InjectAsync(hit, _ => [at], 0, 0, holdMs: 50))
+            return PointTapResult.Delivered($"Synthetic UITouch tap on {hit.GetType().Name}");
+
+        return PointTapResult.Failed(
+            $"{hit.GetType().Name} has no gesture recognizer and is not a registered raw-touch view; "
+            + "add its type to AgentOptions.SyntheticTouchViewTypes if it overrides touchesBegan:");
+    }
+
+    /// <summary>
+    /// The recognizers a finger on <paramref name="hit"/> would feed, walking up to
+    /// <paramref name="element"/> and no further: a recognizer above the element belongs to
+    /// something else, and a tap reported against the element must not act for it. Hover takes
+    /// no touches, and a scroll view's own recognizers scroll rather than tap.
+    /// </summary>
+    /// <remarks>
+    /// Recognizers a lone one-finger tap can never complete — a double tap, a two-finger tap, a
+    /// pinch, a rotation — are left out. UIKit fails them on a timer its gesture environment runs
+    /// for real touches only; fed this tap directly they keep it, and the next tap then completes
+    /// a stale "double tap" at this point. Neither <c>setState:</c> nor <c>reset</c> clears that.
+    /// </remarks>
+    private static List<UIGestureRecognizer> CollectTapRecognizers(UIView hit, UIView element)
+    {
+        var found = new List<UIGestureRecognizer>();
+        for (var current = hit; current != null; current = current.Superview)
+        {
+            if (current is not UIScrollView && current.GestureRecognizers is { } recognizers)
+            {
+                foreach (var recognizer in recognizers)
+                {
+                    if (recognizer.Enabled
+                        && recognizer is not (UIHoverGestureRecognizer or UIScreenEdgePanGestureRecognizer
+                            or UIPinchGestureRecognizer or UIRotationGestureRecognizer)
+                        && recognizer is not UITapGestureRecognizer { NumberOfTapsRequired: > 1 }
+                        && recognizer is not UITapGestureRecognizer { NumberOfTouchesRequired: > 1 })
+                        found.Add(recognizer);
+                }
+            }
+
+            if (ReferenceEquals(current, element))
+                break;
+        }
+
+        return found;
     }
 
     private static Task<string?> AppleDoubleTapAsync(VisualElement element)

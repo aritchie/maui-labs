@@ -23,7 +23,7 @@ public static partial class AndroidCommands
 
 		var command = new Command("install", "Set up Android development environment")
 		{
-			new Option<string>("--sdk-path") { Description = "Custom SDK installation path" },
+			new Option<string>("--sdk-install-path") { Description = "Target path for new SDK installation (not the same as --sdk)" },
 			new Option<string>("--jdk-path") { Description = "Custom JDK installation path" },
 			new Option<int>("--jdk-version") { Description = "JDK version to install (17 or 21)", DefaultValueFactory = _ => JdkManager.DefaultJdkVersion },
 			new Option<bool>("--accept-licenses") { Description = "Non-interactively accept all SDK licenses" },
@@ -32,11 +32,11 @@ public static partial class AndroidCommands
 
 		command.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var dryRun = parseResult.GetValue(GlobalOptions.DryRunOption);
-			var sdkPath = parseResult.GetOption<string>("sdk-path");
+			var sdkPath = parseResult.GetOption<string>("sdk-install-path");
 			var jdkPath = parseResult.GetOption<string>("jdk-path");
 			var jdkVersion = parseResult.GetOption<int>("jdk-version");
 			var rawPackages = parseResult.GetOption<string[]>("packages");
@@ -152,11 +152,12 @@ public static partial class AndroidCommands
 						{
 							formatter.WriteInfo("Android SDK licenses must be accepted to continue.");
 							formatter.WriteInfo("Review each license and type 'y' to accept.\n");
-							var exitCode = await RunInteractiveLicenseAcceptanceAsync(androidProvider, cancellationToken);
-							if (exitCode != 0)
+							_ = await RunInteractiveLicenseAcceptanceAsync(androidProvider, cancellationToken);
+
+							// sdkmanager exits 0 even when the user declines; trust only the on-disk license file.
+							if (!await androidProvider.AreLicensesAcceptedAsync(cancellationToken))
 							{
-								formatter.WriteError(new Exception(
-									$"License acceptance exited with code {exitCode}. Aborting install."));
+								formatter.WriteError(new Exception("Licenses were not accepted. Aborting install."));
 								return 1;
 							}
 							formatter.WriteSuccess("Licenses accepted");
@@ -175,11 +176,28 @@ public static partial class AndroidCommands
 					{
 						var pkgTask = ctx.AddTask($"Installing packages (0/{pkgList.Count})");
 						pkgTask.Update(0, $"Installing packages (0/{pkgList.Count})...");
+
+						// Phase transitions reset the per-package percent (e.g. Downloading 100% →
+						// Unzipping 0%), which would make the overall bar jump backwards. Clamp it to a
+						// high-water mark so the bar only ever moves forward.
+						var highWater = 0.0;
 						await androidProvider.InstallPackagesAsync(pkgList, acceptLicenses,
-							onProgress: (pkg, idx, total) =>
+							onProgress: (AndroidPackageInstallProgress p) =>
 							{
-								var pct = (double)idx / total * 100;
-								pkgTask.Update(pct, $"Installing {pkg} ({idx}/{total})");
+								// Map per-package phase/percent onto the overall bar so large
+								// downloads/extractions show real movement instead of sitting at 100%.
+								var completed = p.PackageIndex - 1;
+								var within = p.Percent >= 0 ? p.Percent / 100.0 : 0;
+								var overall = (completed + within) / p.PackageTotal * 100;
+								highWater = Math.Max(highWater, overall);
+
+								var label = string.IsNullOrEmpty(p.Phase)
+									? $"Installing {p.Package} ({p.PackageIndex}/{p.PackageTotal})"
+									: p.Percent >= 0
+										? $"{p.Phase} {p.Package} ({p.PackageIndex}/{p.PackageTotal}) — {p.Percent}%"
+										: $"{p.Phase} {p.Package} ({p.PackageIndex}/{p.PackageTotal})";
+
+								pkgTask.Update(highWater, label);
 							},
 							cancellationToken);
 						pkgTask.Complete($"{pkgList.Count} packages installed");

@@ -2,6 +2,7 @@
 description: >
   Weekly audit of AI configuration files (AGENTS.md, copilot-instructions.md,
   instruction files) to keep them in sync with the actual codebase.
+  Also audits itself for drift against the repo structure.
 on:
   schedule: weekly
   workflow_dispatch:
@@ -26,7 +27,44 @@ tools:
 network:
   allowed:
     - defaults
+imports:
+  - shared/docs-output-body-limit.md
+
 safe-outputs:
+  steps:
+    - name: Enforce audit output AI disclosure
+      id: enforce_ai_disclosure
+      uses: actions/github-script@v8
+      env:
+        GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}
+      with:
+        script: |
+          const fs = require("node:fs");
+          const disclosures = {
+            create_issue: "AI disclosure: A generative AI model, accessed through GitHub Copilot, determined that the audited documentation may need updating and drafted this issue text. Please verify the recommendation and content before acting.",
+            create_pull_request: "AI disclosure: A generative AI model, accessed through GitHub Copilot, determined that the audited documentation may need updating, proposed the documentation changes, and drafted this pull request text. Please verify the recommendation, changes, and content before acting."
+          };
+          const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+          const output = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+          if (!Array.isArray(output.items)) {
+            throw new Error("Expected safe-output items before enforcing AI disclosure.");
+          }
+          for (const item of output.items) {
+            if (item.type !== "create_issue" && item.type !== "create_pull_request") continue;
+            if (typeof item.body !== "string") {
+              throw new Error("Expected an audit output body before enforcing AI disclosure.");
+            }
+            const disclosure = disclosures[item.type];
+            const notice = `made with AI\n\n${disclosure}`;
+            // Put the notice outside model-authored Markdown, even if it was quoted or hidden.
+            const body = item.body.replaceAll(notice, "").replaceAll(disclosure, "")
+              .replace(/^made with AI[ \t]*\r?$/gm, "").trim();
+            item.body = `${notice}\n\n${body}`;
+            if (item.body.length > 60000) {
+              throw new Error("Audit output body exceeds the 60,000 UTF-16 code unit budget including AI disclosure. Shorten the body and retry.");
+            }
+          }
+          fs.writeFileSync(outputPath, JSON.stringify(output), "utf8");
   create-pull-request:
     title-prefix: "[ai-docs] "
     labels: [ai-docs-audit]
@@ -52,9 +90,16 @@ number, title, and changed file paths.
 
 **Focus areas** — prioritize auditing when PRs touched:
 - `src/Cli/Microsoft.Maui.Cli/DevFlow/Mcp/Tools/` → MCP tools table
-- `*.csproj`, `*.slnf`, `global.json`, `NuGet.config` → packages, build commands, SDK version, feeds
-- `src/DevFlow/` project structure → architecture diagram
-- Pipeline YAML files → CI matrix
+- `src/Cli/Microsoft.Maui.Cli/Commands/` → CLI commands (doctor, device, android, apple, devflow, go, profile, version, project, port)
+- `src/DevFlow/` → DevFlow architecture, agent, driver
+- `src/Comet/`, `src/Go/` → Comet MVU framework and Go server
+- `src/AI/` → Essentials.AI
+- `src/AppProjectReference/` → AppProjectReference
+- `platforms/Linux.Gtk4/`, `platforms/MacOS/`, `platforms/Windows.WPF/` → platform backends
+- `plugins/` → agent skills marketplace
+- `*.csproj`, `*.slnf`, `*.slnx`, `global.json`, `NuGet.config` → packages, build commands, SDK version, feeds
+- `eng/pipelines/` → AzDO pipeline, CI configuration
+- `.github/workflows/` → GitHub Actions CI, agentic workflows
 
 If no PRs were merged in the past 7 days, stop silently — no audit needed.
 
@@ -71,35 +116,55 @@ matching checklist section.
 
 ### AGENTS.md
 
+- **Products table**: Verify all products are listed. Current products:
+  - **Cli** — `src/Cli/` (global tool: `maui`)
+  - **DevFlow** — `src/DevFlow/` (agent, driver, analyzers, Blazor, logging)
+  - **Comet** — `src/Comet/` (MVU framework, source generator, layout)
+  - **Go** — `src/Go/` (single-file Comet apps server + companion app)
+  - **Essentials.AI** — `src/AI/` (on-device AI for .NET MAUI)
+  - **AppProjectReference** — `src/AppProjectReference/`
+  - **Linux GTK4** — `platforms/Linux.Gtk4/`
+  - **macOS AppKit** — `platforms/MacOS/`
+  - **WPF** — `platforms/Windows.WPF/`
+  Run `find src platforms -name "*.csproj" -not -path "*/artifacts/*" | sort` and verify every
+  shipping project is represented in the products table.
+- **CLI commands**: Verify all top-level commands are documented. Current command groups:
+  `doctor`, `device`, `android`, `apple`, `devflow`, `go`, `profile`, `version`, `project`, `port`.
+  Run: `grep "new Command\|rootCommand.Add" src/Cli/Microsoft.Maui.Cli/Program.cs`
 - **MCP tools table**:
   1. Run: `grep -rn "McpServerTool" src/Cli/Microsoft.Maui.Cli/DevFlow/Mcp/Tools/*.cs`
   2. For each match, extract: tool name (from attribute), class name, source file path,
      and description (from XML doc comment or attribute parameter).
   3. Compare with AGENTS.md table — every tool must have exactly one row.
   4. If ANY mismatch: regenerate the entire table sorted by tool name. Do not patch rows.
-  5. Verify: `grep -rl "McpServerTool" src/Cli/Microsoft.Maui.Cli/DevFlow/Mcp/Tools/*.cs | wc -l`
-     and compare against the number of table rows (one tool per file).
-- **Package list**: Run `grep -rn "IsPackable" src --include="*.csproj"` and
-  cross-reference with the documented package list. Every `IsPackable=true` project
-  must appear in the list.
-- **Build commands**: Run `ls src/DevFlow/*.slnf src/Cli/*.slnf 2>/dev/null` and
-  verify AGENTS.md build commands reference these exact paths.
+- **Package list**: Run `grep -rn "IsPackable\|IsShipping" src platforms --include="*.csproj"` and
+  cross-reference with the documented package list. Every `IsPackable=true` or
+  `IsShipping=true` project must appear.
+- **Build commands**: Verify documented solution files match:
+  ```
+  find . \( -name "*.slnf" -o -name "*.slnx" \) -not -path "*/artifacts/*" | sort
+  ```
 - **NuGet feeds**: Run `grep '<add key=' NuGet.config` and compare with the documented feed list.
 - **SDK version**: Run `cat global.json` and verify the documented SDK version matches exactly.
+- **Agent skills**: Verify plugin skill lists match what's documented.
+  Run: `find plugins -mindepth 3 -maxdepth 3 -type d -path '*/skills/*' | sort`
 
 ### .github/copilot-instructions.md
 
 - **Platform patterns**: Compare the documented multi-targeting pattern
-  (Core vs Platform projects, `#if IOS || MACCATALYST` guards, handler
-  registration steps) against actual files in `src/DevFlow/`. Run
+  against actual files in `src/DevFlow/`. Run
   `grep -r '#if ' src/DevFlow/Microsoft.Maui.DevFlow.Agent/` to check
   which `#if` directives are actually used.
 - **MCP tool conventions**: Run `grep -rn 'McpServerTool' src/Cli/Microsoft.Maui.Cli/DevFlow/Mcp/Tools/`
-  and verify that documented naming conventions (`maui_` prefix, snake_case,
-  parameter ordering) match the actual tool attributes.
-- **Arcade gotchas**: Check that the "Arcade SDK Gotchas" section (e.g.,
-  "never modify `eng/common/`") is still accurate by verifying `eng/common/`
-  exists and `.arcaderc` / `global.json` SDK version match what's documented.
+  and verify that documented naming conventions match the actual tool attributes.
+- **CLI command conventions**: Check if the documented patterns for adding new CLI
+  commands (partial classes, `Create()` factory, `Program.GetFormatter()`) still match
+  the actual code in `src/Cli/Microsoft.Maui.Cli/Commands/`.
+- **New product checklist**: Verify the new product checklist covers all current
+  requirements: CI workflow, AzDO pipeline job, signing entries, solution filter,
+  NuGet README with absolute URLs.
+- **Arcade gotchas**: Check that the "Arcade SDK Gotchas" section is still accurate
+  by verifying `eng/common/` exists and `global.json` SDK version matches.
 
 ### .github/instructions/devflow-architecture.instructions.md
 
@@ -123,42 +188,71 @@ matching checklist section.
 
 ### .github/instructions/testing.instructions.md
 
-- **Test projects**: Run `find src -type f \( -name "*.Tests.csproj" -o -name "*Tests*.csproj" \) | sort`
+- **Test projects**: Run `find src platforms -type f \( -name "*.Tests.csproj" -o -name "*Tests*.csproj" \) | sort`
   and verify every result appears in the documented test project list.
 - **Test patterns**: Sample 2-3 recent test files and confirm xUnit patterns
   (attributes, assertion style) match what's documented.
-- **CI matrix**: Run `find . -type f \( -name "*.yml" -o -name "*.yaml" \) | grep -E "pipeline|azure" | sort`
-  and verify documented CI platforms match the actual pipeline definitions.
+- **CI matrix**: Verify documented CI platforms match actual workflows:
+  ```
+  ls .github/workflows/ci-*.yml
+  ```
 
 ### .github/instructions/packaging.instructions.md
 
 - **Package metadata**: Run `cat global.json` for Arcade SDK version, verify
   signing config in `eng/Signing.props`, and check CPM in `Directory.Packages.props`.
 - **Package list**: Must match AGENTS.md (cross-reference both lists).
-- **Feed configuration**: Must match `NuGet.config` (cross-reference with
-  `grep '<add key=' NuGet.config`).
+- **Feed configuration**: Must match `NuGet.config`.
+- **Template packages**: Verify template projects are documented:
+  ```
+  find platforms -name "*Templates.csproj" | sort
+  ```
 
 ### Cross-file consistency (required)
 
 After auditing individual files, verify these stay in sync:
-- **MCP tools table**: Extract tool names from both `AGENTS.md` and
-  `mcp-tools.instructions.md` and diff them:
-  `grep '|' AGENTS.md | grep -i tool | sort` vs equivalent in mcp-tools file.
-  AGENTS.md is authoritative — update mcp-tools to match if they diverge.
-- **Package list**: Extract package names from `AGENTS.md` and
-  `packaging.instructions.md` and verify both list the same packages.
-  Cross-check with `grep -rn "IsPackable" src --include="*.csproj"`.
-- **NuGet feeds**: Run `grep '<add key=' NuGet.config` and verify the same
-  feeds appear in both `AGENTS.md` and `packaging.instructions.md`.
+- **MCP tools table**: AGENTS.md vs mcp-tools.instructions.md — AGENTS.md is authoritative.
+- **Package list**: AGENTS.md vs packaging.instructions.md — cross-check with
+  `grep -rn "IsPackable\|IsShipping" src platforms --include="*.csproj"`.
+- **NuGet feeds**: Both files must match `NuGet.config`.
+- **CLI commands**: AGENTS.md product description must list all command groups
+  that exist in `src/Cli/Microsoft.Maui.Cli/Commands/` and `Program.cs`.
 
-## Step 3: Decide and act
+## Step 3: Self-audit — check this workflow for drift
 
-**If changes are needed:**
+Before finishing, audit whether THIS WORKFLOW (`ai-docs-audit.md`) is still
+accurate and comprehensive. Compare what you observed during the audit against
+the configuration of this workflow itself:
+
+- **Focus area paths (Step 1)**: Are there new source directories, command groups,
+  or product folders that aren't listed in the "Focus areas" section?
+  Run: `ls src/ platforms/` and `ls src/Cli/Microsoft.Maui.Cli/Commands/`
+- **Product list**: Are all products listed in the AGENTS.md audit section?
+  Compare against actual `src/` and `platforms/` directories.
+- **Instruction files**: Are there new `.instructions.md` files that this
+  workflow doesn't have an audit section for?
+  Run: `find .github/instructions -name "*.instructions.md" | sort`
+- **Agentic workflows**: Are there new `.md` workflows that might need auditing?
+  Run: `ls .github/workflows/*.md`
+- **Skills**: Has the skills marketplace structure changed?
+  Run: `find plugins -mindepth 3 -maxdepth 3 -type d -path '*/skills/*' | sort`
+
+If you find drift — paths, products, files, or audit sections that are missing
+or outdated in this workflow — open an issue on this repository with the title
+prefix `[ai-docs]` describing what needs updating in
+`.github/workflows/ai-docs-audit.md`. Be specific about what's missing and why.
+
+## Step 4: Decide and act
+
+**If changes are needed to AI config files:**
 1. Make all corrections and open a single pull request.
 2. PR description must include:
    - Summary: "Updated N files based on M merged PRs"
    - Table of changes: `| File | What changed | Caused by PR |`
    - Example: `| AGENTS.md | Added maui_new_tool to MCP table | #142 |`
+
+**If this workflow needs updating (from Step 3):**
+Open a separate issue describing the drift — do not modify this workflow directly.
 
 **If no changes needed** and there were merged PRs to review, comment on the
 most recent merged PR confirming the AI docs are still in sync. Do NOT create
@@ -177,3 +271,23 @@ an issue just to say "nothing changed."
   referenced by an AI config file section you are updating.
 - When verifying tables "match", ignore whitespace differences but content
   (names, paths, versions) must be exact. File paths are case-sensitive.
+
+## Output disclosure
+
+The trusted `safe-outputs` step prepends a visible `made with AI` line and an
+explicit AI decision-and-drafting disclosure to generated issue and pull request
+bodies before the existing handlers run. The pull request notice also identifies
+the proposed documentation changes as model-generated. Do not add another copy
+or label the edited documentation files. Existing provenance,
+draft configuration, and older-issue handling are unchanged. Framework fallback
+issues retain the notice identifying their originally intended pull request.
+The disclosed body is limited to 60,000 UTF-16 code units, reserving 5,536 for
+generated content. A shared final-payload guard rejects bodies over 65,536 before
+the GitHub request, including unexpectedly large provenance or fallback text.
+Nothing is silently truncated. Existing patch and output-count caps are unchanged.
+
+Local regression check: `node --test .github/workflows/tests/*.test.cjs`.
+Set `GH_AW_ACTIONS_DIR` to gh-aw v0.53.5's `actions/setup/js` directory to also
+exercise its handlers with mocked GitHub and git operations (no API writes).
+After editing the frontmatter, regenerate this workflow's lock file with
+`gh aw compile ai-docs-audit` using gh-aw v0.53.5.

@@ -26,7 +26,11 @@
 # needed on dotnet/docs-maui. If updates are needed, it opens an issue on
 # docs-maui with a detailed description of the changes needed.
 #
-# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"aca99a0b965d805fd31b7246144fe3fa51596ecb5e64db1077df66c625d62c8a","compiler_version":"v0.53.5"}
+# Resolved workflow manifest:
+#   Imports:
+#     - shared/docs-output-body-limit.md
+#
+# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"e68772473ba3d66dd8b0a88bd5c144eefee60edff85edba50e1262e130a746ca","compiler_version":"v0.53.5"}
 
 name: "PR Documentation Check"
 "on":
@@ -171,7 +175,7 @@ jobs:
           cat "/opt/gh-aw/prompts/safe_outputs_prompt.md"
           cat << 'GH_AW_PROMPT_EOF'
           <safe-output-tools>
-          Tools: create_issue, missing_tool, missing_data, noop
+          Tools: create_issue, missing_tool, missing_data
           </safe-output-tools>
           <github-context>
           The following GitHub context information is available for this workflow:
@@ -204,6 +208,9 @@ jobs:
           GH_AW_PROMPT_EOF
           cat << 'GH_AW_PROMPT_EOF'
           </system>
+          GH_AW_PROMPT_EOF
+          cat << 'GH_AW_PROMPT_EOF'
+          {{#runtime-import .github/workflows/shared/docs-output-body-limit.md}}
           GH_AW_PROMPT_EOF
           cat << 'GH_AW_PROMPT_EOF'
           {{#runtime-import .github/workflows/pr-docs-check.md}}
@@ -364,7 +371,7 @@ jobs:
           mkdir -p /tmp/gh-aw/safeoutputs
           mkdir -p /tmp/gh-aw/mcp-logs/safeoutputs
           cat > /opt/gh-aw/safeoutputs/config.json << 'GH_AW_SAFE_OUTPUTS_CONFIG_EOF'
-          {"create_issue":{"max":1},"missing_data":{},"missing_tool":{},"noop":{"max":1}}
+          {"create_issue":{"max":1},"missing_data":{},"missing_tool":{}}
           GH_AW_SAFE_OUTPUTS_CONFIG_EOF
           cat > /opt/gh-aw/safeoutputs/tools.json << 'GH_AW_SAFE_OUTPUTS_TOOLS_EOF'
           [
@@ -449,31 +456,6 @@ jobs:
                 "type": "object"
               },
               "name": "missing_tool"
-            },
-            {
-              "description": "Log a transparency message when no significant actions are needed. Use this to confirm workflow completion and provide visibility when analysis is complete but no changes or outputs are required (e.g., 'No issues found', 'All checks passed'). This ensures the workflow produces human-visible output even when no other actions are taken.",
-              "inputSchema": {
-                "additionalProperties": false,
-                "properties": {
-                  "integrity": {
-                    "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\").",
-                    "type": "string"
-                  },
-                  "message": {
-                    "description": "Status or completion message to log. Should explain what was analyzed and the outcome (e.g., 'Code review complete - no issues found', 'Analysis complete - all tests passing').",
-                    "type": "string"
-                  },
-                  "secrecy": {
-                    "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\").",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "message"
-                ],
-                "type": "object"
-              },
-              "name": "noop"
             },
             {
               "description": "Report that data or information needed to complete the task is not available. Use this when you cannot accomplish what was requested because required data, context, or information is missing.",
@@ -590,17 +572,6 @@ jobs:
                   "type": "string",
                   "sanitize": true,
                   "maxLength": 128
-                }
-              }
-            },
-            "noop": {
-              "defaultMax": 1,
-              "fields": {
-                "message": {
-                  "required": true,
-                  "type": "string",
-                  "sanitize": true,
-                  "maxLength": 65000
                 }
               }
             }
@@ -1005,7 +976,6 @@ jobs:
       group: "gh-aw-conclusion-pr-docs-check"
       cancel-in-progress: false
     outputs:
-      noop_message: ${{ steps.noop.outputs.noop_message }}
       tools_reported: ${{ steps.missing_tool.outputs.tools_reported }}
       total_count: ${{ steps.missing_tool.outputs.total_count }}
     steps:
@@ -1026,20 +996,6 @@ jobs:
           mkdir -p /tmp/gh-aw/safeoutputs/
           find "/tmp/gh-aw/safeoutputs/" -type f -print
           echo "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/safeoutputs/agent_output.json" >> "$GITHUB_ENV"
-      - name: Process No-Op Messages
-        id: noop
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}
-          GH_AW_NOOP_MAX: "1"
-          GH_AW_WORKFLOW_NAME: "PR Documentation Check"
-        with:
-          github-token: ${{ secrets.MAUI_BOT_TOKEN }}
-          script: |
-            const { setupGlobals } = require('/opt/gh-aw/actions/setup_globals.cjs');
-            setupGlobals(core, github, context, exec, io);
-            const { main } = require('/opt/gh-aw/actions/noop.cjs');
-            await main();
       - name: Record Missing Tool
         id: missing_tool
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -1082,8 +1038,6 @@ jobs:
           GH_AW_WORKFLOW_NAME: "PR Documentation Check"
           GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_AW_AGENT_CONCLUSION: ${{ needs.agent.result }}
-          GH_AW_NOOP_MESSAGE: ${{ steps.noop.outputs.noop_message }}
-          GH_AW_NOOP_REPORT_AS_ISSUE: "true"
         with:
           github-token: ${{ secrets.MAUI_BOT_TOKEN }}
           script: |
@@ -1158,6 +1112,83 @@ jobs:
           mkdir -p /tmp/gh-aw/safeoutputs/
           find "/tmp/gh-aw/safeoutputs/" -type f -print
           echo "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/safeoutputs/agent_output.json" >> "$GITHUB_ENV"
+      - name: Enforce documentation issue AI disclosure
+        id: enforce_ai_disclosure
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const disclosure = "AI disclosure: A generative AI model, accessed through GitHub Copilot, determined that documentation changes may be needed and drafted this issue. Please verify the recommendation and content before acting.";
+            const notice = `made with AI\n\n${disclosure}`;
+            const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+            const output = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+            if (!Array.isArray(output.items)) {
+              throw new Error("Expected safe-output items before enforcing AI disclosure.");
+            }
+            for (const item of output.items) {
+              if (item.type === "update_issue") {
+                throw new Error("Issue updates are not supported by PR Documentation Check.");
+              }
+              if (item.type !== "create_issue") continue;
+              if (typeof item.body !== "string") {
+                throw new Error("Expected a documentation issue body before enforcing AI disclosure.");
+              }
+              // Put the notice outside model-authored Markdown, even if it was quoted or hidden.
+              const body = item.body.replaceAll(notice, "").replaceAll(disclosure, "")
+                .replace(/^made with AI[ \t]*\r?$/gm, "").trim();
+              item.body = `${notice}\n\n${body}`;
+              if (item.body.length > 60000) {
+                throw new Error("Documentation issue body exceeds the 60,000 UTF-16 code unit budget including AI disclosure. Shorten the body and retry.");
+              }
+            }
+            fs.writeFileSync(outputPath, JSON.stringify(output), "utf8");
+      - name: Guard final documentation output body sizes
+        id: guard_output_body_sizes
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |-
+            const fs = require("node:fs");
+            const entrypoint = "/opt/gh-aw/actions/safe_output_handler_manager.cjs";
+            const original = "/opt/gh-aw/actions/docs_original_handler_manager.cjs";
+            if (fs.existsSync(original)) {
+              throw new Error("Documentation output body guard was already installed.");
+            }
+            fs.renameSync(entrypoint, original);
+            // gh-aw v0.53.5 has no final-body hook; retain its dispatcher and guard its API client.
+            fs.writeFileSync(entrypoint, `
+            const handler = require("./docs_original_handler_manager.cjs");
+            module.exports = {
+              ...handler,
+              async main(...args) {
+                const restorations = [];
+                for (const resource of ["issues", "pulls"]) {
+                  for (const operation of ["create", "update"]) {
+                    const client = github.rest[resource];
+                    const send = client[operation];
+                    client[operation] = async function (params) {
+                      // UTF-16 length is conservative for non-BMP text; never truncate disclosure or provenance.
+                      if (typeof params.body === "string" && params.body.length > 65536) {
+                        const message = "Documentation output " + resource + "." + operation
+                          + " body exceeds GitHub's 65,536-character limit after disclosure and generated content ("
+                          + params.body.length + " UTF-16 code units). Shorten the generated body and retry.";
+                        core.setFailed(message);
+                        throw new Error(message);
+                      }
+                      return send.call(this, params);
+                    };
+                    restorations.push(() => { client[operation] = send; });
+                  }
+                }
+                try {
+                  return await handler.main(...args);
+                } finally {
+                  for (const restore of restorations) restore();
+                }
+              }
+            };
+            `, "utf8");
       - name: Process Safe Outputs
         id: process_safe_outputs
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8

@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -32,53 +33,93 @@ public abstract class IntegrationTestBase
 
     protected async Task<JsonElement> GetJsonAsync(string path)
     {
-        var response = await Http.GetAsync(path);
+        using var response = await SendHttpWithTransportRetryAsync(() => Http.GetAsync(path));
         response.EnsureSuccessStatusCode();
         var body = await response.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<JsonElement>(body, JsonOptions);
     }
 
-    protected Task<HttpResponseMessage> GetRawAsync(string path) => Http.GetAsync(path);
+    protected Task<HttpResponseMessage> GetRawAsync(string path)
+        => SendHttpWithTransportRetryAsync(() => Http.GetAsync(path));
 
     protected async Task<JsonElement> PostJsonAsync(string path, object? body = null)
     {
-        var content = body != null
-            ? new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json")
-            : null;
-        var response = await Http.PostAsync(path, content);
+        using var response = await SendMutationRawAsync(HttpMethod.Post, path, body);
         response.EnsureSuccessStatusCode();
         var responseBody = await response.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<JsonElement>(responseBody, JsonOptions);
     }
 
     protected Task<HttpResponseMessage> PostRawAsync(string path, object? body = null)
-    {
-        var content = body != null
-            ? new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json")
-            : null;
-        return Http.PostAsync(path, content);
-    }
+        => SendMutationRawAsync(HttpMethod.Post, path, body);
 
     protected async Task<JsonElement> PutJsonAsync(string path, object? body = null)
     {
-        var content = body != null
-            ? new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json")
-            : null;
-        var response = await Http.PutAsync(path, content);
+        using var response = await SendMutationRawAsync(HttpMethod.Put, path, body);
         response.EnsureSuccessStatusCode();
         var responseBody = await response.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<JsonElement>(responseBody, JsonOptions);
     }
 
-    protected Task<HttpResponseMessage> DeleteRawAsync(string path) => Http.DeleteAsync(path);
+    protected Task<HttpResponseMessage> DeleteRawAsync(string path)
+        => SendMutationRawAsync(HttpMethod.Delete, path);
 
     protected async Task<JsonElement> DeleteJsonAsync(string path)
     {
-        var response = await Http.DeleteAsync(path);
+        using var response = await SendMutationRawAsync(HttpMethod.Delete, path);
         response.EnsureSuccessStatusCode();
         var responseBody = await response.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<JsonElement>(responseBody, JsonOptions);
     }
+
+    async Task<HttpResponseMessage> SendMutationRawAsync(HttpMethod method, string path, object? body = null)
+    {
+        var lease = await Client.ControlMutationLeaseAsync("claim");
+        if (!lease.YouHold)
+            throw new MutationLeaseException(lease);
+
+        return await SendHttpWithTransportRetryAsync(async () =>
+        {
+            using var request = new HttpRequestMessage(method, path);
+            request.Headers.TryAddWithoutValidation("X-DevFlow-Lease", Client.MutationLeaseId);
+            request.Headers.TryAddWithoutValidation("X-DevFlow-Holder", Client.MutationLeaseHolderKind);
+            if (!string.IsNullOrWhiteSpace(Client.MutationLeaseLabel))
+                request.Headers.TryAddWithoutValidation("X-DevFlow-Label", Client.MutationLeaseLabel);
+            request.Content = CreateJsonContent(body);
+            return await Http.SendAsync(request);
+        });
+    }
+
+    static StringContent? CreateJsonContent(object? body)
+        => body != null
+            ? new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json")
+            : null;
+
+    async Task<T> SendHttpWithTransportRetryAsync<T>(Func<Task<T>> send)
+    {
+        var retryCount = Platform == "android" ? 8 : 0;
+
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await send();
+            }
+            catch (Exception ex) when (IsTransientTransportException(ex) && attempt < retryCount)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * Math.Min(attempt + 1, 5)));
+            }
+        }
+    }
+
+    static bool IsTransientTransportException(Exception ex)
+        => ex switch
+        {
+            HttpRequestException { InnerException: SocketException } => true,
+            IOException => true,
+            TaskCanceledException tce when tce.InnerException is not null and not TimeoutException => true,
+            _ => ex.InnerException is not null && IsTransientTransportException(ex.InnerException),
+        };
 
     protected async Task<ElementInfo> FindElementAsync(string automationId, int timeoutMs = 5000)
     {
@@ -104,13 +145,31 @@ public abstract class IntegrationTestBase
         return results.Count > 0 ? results[0] : null;
     }
 
+    /// <summary>
+    /// The control type name a "button" reports on the framework and platform under test.
+    /// MAUI normalises every platform to <c>Button</c>; the native backends report the real
+    /// platform type, which differs per OS.
+    /// </summary>
+    protected string ButtonTypeName => TestFramework.IsNative
+        ? App.Platform switch
+        {
+            "android" => "Button",
+            "ios" or "maccatalyst" => "UIButton",
+            "macos" => "NSButton",
+            var other => throw new InvalidOperationException($"No native button type for '{other}'."),
+        }
+        : "Button";
+
     protected async Task NavigateToPageAsync(string route, string? expectedAutomationId = null, int timeoutMs = 5000)
     {
-        await Client.NavigateAsync(route);
+        // Routes are Shell navigation, which only the MAUI sample has. The native samples are a
+        // single screen carrying the same ids, so a route request degrades to "wait for the anchor".
+        if (!TestFramework.IsNative)
+            await Client.NavigateAsync(route);
 
         if (expectedAutomationId != null)
             await FindElementAsync(expectedAutomationId, timeoutMs);
-        else
+        else if (!TestFramework.IsNative)
             await Task.Delay(500);
     }
 

@@ -16,13 +16,14 @@ public class AlertsPage : ContentPage
 
 		var resultLabel = new Label
 		{
+			AutomationId = "WpfDialogResultLabel",
 			Text = "Result: (none yet)",
 			FontSize = 14,
 			TextColor = Colors.DodgerBlue,
 		};
 
 		// Simple alert (OK only)
-		var simpleAlertBtn = new Button { Text = "Simple Alert (OK)" };
+		var simpleAlertBtn = new Button { Text = "Simple Alert (OK)", AutomationId = "WpfSimpleAlertBtn" };
 		simpleAlertBtn.Clicked += async (s, e) =>
 		{
 			resultLabel.Text = "Result: Alert requested...";
@@ -30,16 +31,16 @@ public class AlertsPage : ContentPage
 			resultLabel.Text = "Result: Simple alert dismissed";
 		};
 
-		// Confirm alert (Accept / Cancel)
-		var confirmAlertBtn = new Button { Text = "Confirm Alert (Yes / No)" };
+		// Custom labels make platform fallback button captions visible.
+		var confirmAlertBtn = new Button { Text = "Confirm Alert (Remove / Keep)", AutomationId = "WpfConfirmAlertBtn" };
 		confirmAlertBtn.Clicked += async (s, e) =>
 		{
-			bool answer = await ConnectedPage.DisplayAlertAsync("Confirm", "Do you want to proceed?", "Yes", "No");
+			bool answer = await ConnectedPage.DisplayAlertAsync("Confirm", "Do you want to remove this item?", "Remove", "Keep");
 			resultLabel.Text = $"Result: Confirmed = {answer}";
 		};
 
 		// Action sheet
-		var actionSheetBtn = new Button { Text = "Action Sheet" };
+		var actionSheetBtn = new Button { Text = "Action Sheet", AutomationId = "WpfActionSheetBtn" };
 		actionSheetBtn.Clicked += async (s, e) =>
 		{
 			string action = await ConnectedPage.DisplayActionSheetAsync(
@@ -51,7 +52,7 @@ public class AlertsPage : ContentPage
 		};
 
 		// Action sheet without destruction
-		var actionSheet2Btn = new Button { Text = "Action Sheet (no destructive)" };
+		var actionSheet2Btn = new Button { Text = "Action Sheet (no destructive)", AutomationId = "WpfActionSheetNoDestructiveBtn" };
 		actionSheet2Btn.Clicked += async (s, e) =>
 		{
 			string action = await ConnectedPage.DisplayActionSheetAsync(
@@ -63,7 +64,7 @@ public class AlertsPage : ContentPage
 		};
 
 		// Prompt
-		var promptBtn = new Button { Text = "Text Prompt" };
+		var promptBtn = new Button { Text = "Text Prompt", AutomationId = "WpfPromptBtn" };
 		promptBtn.Clicked += async (s, e) =>
 		{
 			string name = await ConnectedPage.DisplayPromptAsync("Your Name", "What should we call you?", placeholder: "Enter name...");
@@ -71,7 +72,7 @@ public class AlertsPage : ContentPage
 		};
 
 		// Prompt with initial value
-		var promptInitBtn = new Button { Text = "Prompt (with initial value)" };
+		var promptInitBtn = new Button { Text = "Prompt (with initial value)", AutomationId = "WpfPromptInitialValueBtn" };
 		promptInitBtn.Clicked += async (s, e) =>
 		{
 			string value = await ConnectedPage.DisplayPromptAsync("Edit Value", "Modify the text below:", initialValue: "Hello World");

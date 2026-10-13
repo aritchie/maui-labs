@@ -4,6 +4,9 @@ Microsoft.Maui.DevFlow includes a **broker daemon** that coordinates port assign
 discovery across multiple running apps. It eliminates port collisions when debugging
 several MAUI apps (or the same app on different platforms) simultaneously.
 
+For browser, VS Code, GitHub Copilot desktop, and Copilot CLI setup, see the
+[MAUI DevFlow Inspector guide](inspector.md).
+
 ## Overview
 
 The broker is a lightweight background process that:
@@ -11,7 +14,7 @@ The broker is a lightweight background process that:
 - **Assigns unique ports** to each MAUI agent from a shared pool (10223–10899)
 - **Tracks running agents** so the CLI can discover them without manual `--agent-port` flags
 - **Detects disconnections instantly** via persistent WebSocket connections
-- **Starts and stops automatically** — you rarely need to manage it directly
+- **Starts on demand and stops automatically** — you rarely need to manage it directly
 
 ```
                     ┌──────────────────────────────────┐
@@ -137,13 +140,17 @@ This means:
 
 ### Automatic Start
 
-The broker starts transparently — you don't need to launch it manually. Both the CLI
-and the agent call `EnsureBrokerRunningAsync()` which:
+Broker-dependent CLI commands such as `maui devflow list` and `maui devflow wait` call
+`EnsureBrokerRunningAsync()`:
 
 1. **Read state file** (`~/.mauidevflow/broker.json`) for the broker's port hint
 2. **TCP connect** to `localhost:{port}` (500ms timeout, <1ms if refused)
 3. If alive → use it
 4. If not → clean up stale PID, fork a new broker process, poll until ready (5s timeout)
+
+The app does not spawn the broker. Its agent retries registration until a CLI command, Copilot
+Canvas, or an explicit `maui devflow broker start` makes the broker available. The VS Code host
+also expects the broker to be running.
 
 The state file looks like:
 ```json
@@ -277,10 +284,13 @@ The HTTP server stays up throughout reconnection attempts — only broker discov
 | Windows        | `localhost:19223` direct     | `localhost:{port}` direct |
 | Linux/GTK      | `localhost:19223` direct     | `localhost:{port}` direct |
 | iOS Simulator  | Shares host network, direct  | `localhost:{port}` direct |
-| Android Emu    | `adb reverse tcp:19223 tcp:19223` | `adb reverse tcp:{port} tcp:{port}` |
+| Android Emu    | `adb reverse tcp:19223 tcp:19223` | `adb forward tcp:{port} tcp:{port}` |
 
-For Android, you need `adb reverse` for both the broker port (always 19223) and the
-agent's assigned port. The broker port only needs to be set up once per emulator session.
+For Android, the two directions are different: the app reaches the host broker through
+`adb reverse tcp:19223 tcp:19223`, while the host CLI reaches the in-emulator agent
+through `adb forward tcp:{port} tcp:{port}`. The CLI prepares these mappings
+automatically when it can select a single online Android device. If multiple devices are
+online, pass `--device <serial>` or set `ANDROID_SERIAL` so it does not guess.
 
 ## File Locations
 
@@ -331,9 +341,13 @@ The broker exposes a simple HTTP API on port 19223 for CLI and diagnostic use:
 - **Broker running?** Run `maui devflow broker status` to check.
 - **App actually started?** The agent registers during app startup. Verify the
   app launched successfully.
-- **Firewall?** On Android, ensure `adb reverse tcp:19223 tcp:19223` is set up.
+- **Firewall?** On Android, run `maui devflow diagnose` and check the `android`
+  forwarding section. If multiple devices are online, retry with
+  `--device <serial>`.
 - **Custom port in code?** If `AddMicrosoft.Maui.DevFlowAgent(o => o.Port = XXXX)` sets a
-  non-default port, the agent skips broker registration and uses the hardcoded port.
+  non-default port, the agent includes that `currentPort` during broker registration so
+  the broker reuses the hardcoded port. If broker registration is unavailable, the CLI
+  direct fallback still uses the configured port.
 
 ### CLI can't connect to agent
 
@@ -341,12 +355,14 @@ The broker exposes a simple HTTP API on port 19223 for CLI and diagnostic use:
   Run `maui devflow list` to see actual port assignments.
 - **Agent crashed after registration?** The broker may show the agent briefly
   before detecting the disconnect. Wait a moment and check again.
-- **Android?** You need `adb reverse` for **both** port 19223 (broker) and the
-  agent's assigned port.
+- **Android?** `maui devflow list`, `maui devflow wait`, and auto-resolved agent commands repair ADB
+  forwarding when possible; `maui devflow diagnose` reports the state without changing it. Manually, use
+  `adb reverse tcp:19223 tcp:19223` for broker registration and
+  `adb forward tcp:{port} tcp:{port}` for the CLI-to-agent HTTP path.
 
 ### Broker exits unexpectedly
 
 - Check `~/.mauidevflow/broker.log` for error messages.
 - The broker auto-exits after 5 minutes of idle time (no agents, no CLI requests).
-  This is normal behavior — it will restart automatically on the next CLI command
-  or app launch.
+  This is normal behavior — it will restart on the next broker-dependent CLI command or when the
+  Copilot Canvas host bootstraps it.

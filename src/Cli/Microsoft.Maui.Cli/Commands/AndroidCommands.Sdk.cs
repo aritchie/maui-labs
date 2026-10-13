@@ -21,7 +21,7 @@ public static partial class AndroidCommands
 		var checkCommand = new Command("check", "Check Android SDK installation status");
 		checkCommand.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var formatter = Program.GetFormatter(parseResult);
@@ -67,7 +67,7 @@ public static partial class AndroidCommands
 		};
 		installCommand.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var dryRun = parseResult.GetValue(GlobalOptions.DryRunOption);
@@ -270,7 +270,7 @@ public static partial class AndroidCommands
 		};
 		listCommand.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var showAvailable = parseResult.GetOption<bool>("available");
@@ -388,7 +388,7 @@ public static partial class AndroidCommands
 		var acceptLicensesCommand = new Command("accept-licenses", "Accept Android SDK licenses interactively");
 		acceptLicensesCommand.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var formatter = Program.GetFormatter(parseResult);
@@ -454,15 +454,18 @@ public static partial class AndroidCommands
 					formatter.WriteInfo("Starting interactive license acceptance...");
 					formatter.WriteInfo("Review each license and type 'y' to accept.\n");
 
-					var exitCode = await RunInteractiveLicenseAcceptanceAsync(androidProvider, cancellationToken);
-					if (exitCode == 0)
+					_ = await RunInteractiveLicenseAcceptanceAsync(androidProvider, cancellationToken);
+
+					// sdkmanager exits 0 even when the user declines; trust only the on-disk license file.
+					var interactiveLicensesAccepted = await androidProvider.AreLicensesAcceptedAsync(cancellationToken);
+					if (interactiveLicensesAccepted)
 					{
 						formatter.WriteSuccess("License acceptance completed");
 						return 0;
 					}
 
-					formatter.WriteWarning($"License acceptance exited with code {exitCode}");
-					return exitCode;
+					formatter.WriteWarning("Licenses were not accepted");
+					return 1;
 				}
 				return 0;
 			}
@@ -490,7 +493,7 @@ public static partial class AndroidCommands
 
 		command.SetAction(async (ParseResult parseResult, CancellationToken cancellationToken) =>
 		{
-			var androidProvider = Program.AndroidProvider;
+			var androidProvider = GetAndroidProvider(parseResult);
 
 			var useJson = parseResult.GetValue(GlobalOptions.JsonOption);
 			var dryRun = parseResult.GetValue(GlobalOptions.DryRunOption);

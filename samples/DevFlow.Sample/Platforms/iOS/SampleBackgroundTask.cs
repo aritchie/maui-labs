@@ -25,6 +25,7 @@ public static class SampleBackgroundTask
 
     public const string RunCountPreference = "bgtask-run-count";
     public const string LastRunPreference = "bgtask-last-run-utc";
+    public const string ReschedulePreference = "bgtask-reschedule";
 
     /// <summary>
     /// Registers the launch handler. Must be called before didFinishLaunchingWithOptions returns,
@@ -37,6 +38,8 @@ public static class SampleBackgroundTask
             Preferences.Set(RunCountPreference, Preferences.Get(RunCountPreference, 0) + 1);
             Preferences.Set(LastRunPreference, DateTime.UtcNow.ToString("O"));
             Console.WriteLine($"[DevFlow.Sample] BGTask '{SyncTaskIdentifier}' executed.");
+            if (Preferences.Get(ReschedulePreference, false))
+                Console.WriteLine($"[DevFlow.Sample] BGTask reschedule: {Schedule()}");
             task.SetTaskCompleted(true);
         });
     }
@@ -55,6 +58,7 @@ public static class SampleBackgroundTask
         return error != null ? $"submit failed: {error.LocalizedDescription}" : "submitted";
     }
 
+#if DEBUG
     [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
     private static extern void SendSimulateLaunch(IntPtr receiver, IntPtr selector, IntPtr identifier);
 
@@ -66,8 +70,10 @@ public static class SampleBackgroundTask
     /// </summary>
     [DevFlowAction("bgtask-simulate-launch", Description = "Force a registered BGTask to run now (debug only; uses a private selector)")]
     public static string SimulateLaunch(
-        [System.ComponentModel.Description("BGTask identifier to launch")] string identifier = SyncTaskIdentifier)
+        [System.ComponentModel.Description("BGTask identifier to launch")] string identifier = SyncTaskIdentifier,
+        [System.ComponentModel.Description("Reschedule the sample task from its handler")] bool reschedule = false)
     {
+        Preferences.Set(ReschedulePreference, reschedule);
         var selector = new Selector("_simulateLaunchForTaskWithIdentifier:");
         var scheduler = BGTaskScheduler.Shared;
 
@@ -78,6 +84,7 @@ public static class SampleBackgroundTask
         SendSimulateLaunch(scheduler.Handle, selector.Handle, nsIdentifier.Handle);
         return $"invoked _simulateLaunchForTaskWithIdentifier: for '{identifier}'";
     }
+#endif
 
     [DevFlowAction("bgtask-schedule", Description = "Submit the sample BGTask request so it becomes pending")]
     public static string ScheduleAction() => Schedule();

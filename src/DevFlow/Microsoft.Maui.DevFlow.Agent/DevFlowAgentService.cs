@@ -549,6 +549,37 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
     private const string WorkManagerMissingReason =
         "androidx.work.WorkManager is not on the app's classpath. Add the Xamarin.AndroidX.Work.Runtime " +
         "package (or a library that depends on it) to enable background job inspection.";
+
+    private static List<object> GetScheduledWorkManagerJobs()
+    {
+        var scheduler = global::Android.App.Application.Context.GetSystemService(
+            global::Android.Content.Context.JobSchedulerService) as global::Android.App.Job.JobScheduler
+            ?? throw new InvalidOperationException("Android JobScheduler is unavailable.");
+        var jobs = new List<object>();
+        AddJobs(scheduler, null);
+        if (OperatingSystem.IsAndroidVersionAtLeast(34))
+            AddJobs(scheduler.ForNamespace("androidx.work.systemjobscheduler"), "androidx.work.systemjobscheduler");
+        return jobs;
+
+        void AddJobs(global::Android.App.Job.JobScheduler jobScheduler, string? jobNamespace)
+        {
+            foreach (var job in jobScheduler.AllPendingJobs
+                ?? throw new InvalidOperationException("JobScheduler returned no pending-job collection."))
+            {
+                if (job.Service?.ClassName != "androidx.work.impl.background.systemjob.SystemJobService")
+                    continue;
+                var workSpecId = job.Extras?.GetString("EXTRA_WORK_SPEC_ID");
+                if (!Guid.TryParse(workSpecId, out _))
+                    throw new InvalidOperationException($"WorkManager job {job.Id} has no valid EXTRA_WORK_SPEC_ID.");
+                jobs.Add(new Dictionary<string, object?>
+                {
+                    ["workSpecId"] = workSpecId,
+                    ["jobId"] = job.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["namespace"] = jobNamespace
+                });
+            }
+        }
+    }
 #endif
 
     protected override bool IsJobsSupported
@@ -712,7 +743,15 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 });
             }
 
-            return new Dictionary<string, object?> { ["platform"] = "Android", ["type"] = "WorkManager", ["supported"] = true, ["runSupported"] = false, ["jobs"] = jobs };
+            return new Dictionary<string, object?>
+            {
+                ["platform"] = "Android",
+                ["type"] = "WorkManager",
+                ["supported"] = true,
+                ["runSupported"] = false,
+                ["jobs"] = jobs,
+                ["scheduledJobs"] = GetScheduledWorkManagerJobs()
+            };
         }
         catch (Exception ex)
         {
@@ -807,22 +846,19 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 };
             }
 
-            // The scheduler consumes the pending request when it launches it, so the request
-            // disappearing is the observable evidence that a launch really happened.
-            await Task.Delay(1500);
-            var stillPending = await IsBgTaskPendingAsync(identifier);
-
+            // A handler may reschedule its identifier immediately. Pending requests cannot
+            // prove either execution or completion; only acknowledge the launch request.
             return new Dictionary<string, object?>
             {
-                ["success"] = !stillPending,
+                ["success"] = true,
                 ["identifier"] = identifier,
                 ["type"] = taskType,
-                ["launched"] = true,
-                ["consumedPendingRequest"] = !stillPending,
-                ["message"] = stillPending
-                    ? $"BGTask '{identifier}' launch was requested but the request is still pending; the handler may not be registered."
-                    : $"BGTask '{identifier}' was launched and its pending request was consumed.",
-                ["note"] = "iOS does not expose a task's result; assert on what the handler itself records."
+                ["launchRequested"] = true,
+                ["executionVerified"] = false,
+                ["completionVerified"] = false,
+                ["message"] = $"Launch requested for BGTask '{identifier}'.",
+                ["note"] = "This acknowledges the debug launch request, not handler execution or completion. " +
+                    "Assert on the handler's own recorded outcome; a pending request may be its next scheduled run."
             };
         }
         catch (Exception ex)

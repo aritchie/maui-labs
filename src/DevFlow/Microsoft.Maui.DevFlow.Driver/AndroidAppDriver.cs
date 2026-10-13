@@ -506,9 +506,9 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// identifier is a numeric job id rather than a WorkSpec UUID.
     /// </para>
     /// </summary>
-    public async Task<IReadOnlyList<AndroidScheduledJob>> ListScheduledJobsAsync(string packageName)
+    public virtual async Task<IReadOnlyList<AndroidScheduledJob>> ListScheduledJobsAsync(string packageName)
     {
-        var dump = await RunAdbWithOutputAsync("shell dumpsys jobscheduler");
+        var dump = await RunAdbWithOutputAsync("shell", "dumpsys", "jobscheduler");
         return ParseScheduledJobs(dump, packageName);
     }
 
@@ -536,8 +536,6 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
         {
             var line = rawLine.Trim();
             if (!line.StartsWith("JOB ", StringComparison.Ordinal)) continue;
-            if (!line.Contains(packageName, StringComparison.Ordinal)) continue;
-
             var match = pattern.Match(line);
             if (!match.Success) continue;
 
@@ -559,7 +557,8 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
             var worker = workerMatch.Success ? workerMatch.Groups["worker"].Value : null;
 
             var serviceMatch = System.Text.RegularExpressions.Regex.Match(
-                detail, System.Text.RegularExpressions.Regex.Escape(packageName) + @"/(?<service>\S+)");
+                detail, @"(?:^|@|\s)" + System.Text.RegularExpressions.Regex.Escape(packageName) + @"/(?<service>\S+)");
+            if (!serviceMatch.Success) continue;
             var service = serviceMatch.Success ? serviceMatch.Groups["service"].Value : null;
 
             var key = $"{ns}|{jobId}";
@@ -584,8 +583,7 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// </summary>
     public async Task<string> GetJobStateAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace)
     {
-        var ns = string.IsNullOrWhiteSpace(jobNamespace) ? "" : $"-n {jobNamespace} ";
-        var output = await RunAdbWithOutputAsync($"shell cmd jobscheduler get-job-state {ns}{packageName} {jobId}");
+        var output = await RunAdbWithOutputAsync(BuildJobSchedulerArguments("get-job-state", packageName, jobId, jobNamespace));
         return output.Trim();
     }
 
@@ -596,11 +594,9 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// Ignore unmet constraints. Required for anything with a delay or a network/charging
     /// requirement, which is most real work; without it JobScheduler declines.
     /// </param>
-    public async Task<string> RunScheduledJobAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace, bool force = true)
+    public virtual async Task<string> RunScheduledJobAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace, bool force = true)
     {
-        var ns = string.IsNullOrWhiteSpace(jobNamespace) ? "" : $"-n {jobNamespace} ";
-        var flag = force ? "-f " : "";
-        var output = await RunAdbWithOutputAsync($"shell cmd jobscheduler run {flag}{ns}{packageName} {jobId}");
+        var output = await RunAdbWithOutputAsync(BuildJobSchedulerArguments("run", packageName, jobId, jobNamespace, force));
         return output.Trim();
     }
 
@@ -609,9 +605,19 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// </summary>
     public async Task<string> StopScheduledJobAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace)
     {
-        var ns = string.IsNullOrWhiteSpace(jobNamespace) ? "" : $"-n {jobNamespace} ";
-        var output = await RunAdbWithOutputAsync($"shell cmd jobscheduler stop {ns}{packageName} {jobId}");
+        var output = await RunAdbWithOutputAsync(BuildJobSchedulerArguments("stop", packageName, jobId, jobNamespace));
         return output.Trim();
+    }
+
+    internal static string[] BuildJobSchedulerArguments(
+        string action, string packageName, string jobId, string? jobNamespace, bool force = false)
+    {
+        var arguments = new List<string> { "shell", "cmd", "jobscheduler", action };
+        if (force) arguments.Add("-f");
+        if (!string.IsNullOrWhiteSpace(jobNamespace))
+            arguments.AddRange(["-n", jobNamespace]);
+        arguments.AddRange([packageName, jobId]);
+        return arguments.ToArray();
     }
 
     // ──────────────────────────────────────────────

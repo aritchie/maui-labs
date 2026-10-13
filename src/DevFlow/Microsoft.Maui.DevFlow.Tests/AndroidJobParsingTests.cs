@@ -45,8 +45,7 @@ public class AndroidJobParsingTests
     {
         var job = AndroidAppDriver.ParseScheduledJobs(Dumpsys, Package).Single();
 
-        // WorkSpec UUIDs are invisible to JobScheduler, so the worker name in the #…# debug
-        // tag is what lets a caller map a WorkManager job onto a numeric job id.
+        // This is a display label only; it cannot uniquely identify a WorkSpec.
         Assert.Equal("SampleSyncWorker", job.Worker);
         Assert.Contains("SystemJobService", job.Service);
     }
@@ -77,5 +76,47 @@ public class AndroidJobParsingTests
         Assert.Equal("808", job.JobId);
         Assert.Null(job.Namespace);
         Assert.False(job.IsWorkManager);
+    }
+
+    [Fact]
+    public void ParseScheduledJobs_DoesNotMatchAPackageNameSuffix()
+    {
+        const string dump = "JOB #u0a233/5: abcd other.com.companyname.mauitodo/com.example.Service";
+        Assert.Empty(AndroidAppDriver.ParseScheduledJobs(dump, Package));
+    }
+
+    [Fact]
+    public void ParseScheduledJobs_SameWorkerWithDifferentIds_KeepsBothRequests()
+    {
+        var dump = Dumpsys + "\n" +
+            $"JOB androidx.work.systemjobscheduler:u0a233/2: abcd #SampleSyncWorker#@androidx.work.systemjobscheduler@{Package}/androidx.work.impl.background.systemjob.SystemJobService";
+        var jobs = AndroidAppDriver.ParseScheduledJobs(dump, Package);
+        Assert.Equal(new[] { "1", "2" }, jobs.Select(j => j.JobId));
+        Assert.All(jobs, j => Assert.Equal("SampleSyncWorker", j.Worker));
+    }
+
+    [Fact]
+    public void RunArguments_KeepAdbCommandsAndFlagsAsSeparateArguments()
+    {
+        var arguments = AndroidAppDriver.BuildJobSchedulerArguments(
+            "run", Package, "10", AndroidAppDriver.WorkManagerNamespace, force: true);
+        Assert.Equal(new[]
+        {
+            "shell", "cmd", "jobscheduler", "run", "-f", "-n",
+            AndroidAppDriver.WorkManagerNamespace, Package, "10"
+        }, arguments);
+        var startInfo = AndroidAppDriver.CreateAdbProcessStartInfo("adb",
+            AndroidAppDriver.BuildAdbArguments("emulator-5588", arguments));
+        Assert.Equal(new[] { "-s", "emulator-5588" }.Concat(arguments), startInfo.ArgumentList);
+    }
+
+    [Theory]
+    [InlineData("run")]
+    [InlineData("get-job-state")]
+    [InlineData("stop")]
+    public void SchedulerArguments_UnnamespacedJob_OmitsNamespaceAndForce(string action)
+    {
+        Assert.Equal(new[] { "shell", "cmd", "jobscheduler", action, Package, "10" },
+            AndroidAppDriver.BuildJobSchedulerArguments(action, Package, "10", null));
     }
 }

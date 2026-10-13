@@ -174,7 +174,8 @@ public class DeviceTests : IntegrationTestBase
 
         var sampleJob = jobs.FirstOrDefault(j =>
             j.TryGetProperty("tags", out var tags) &&
-            tags.EnumerateArray().Any(t => t.GetString() == "devflow-sample-sync"));
+            tags.EnumerateArray().Any(t => t.GetString() == "devflow-sample-sync") &&
+            j.GetProperty("state").GetString() == "ENQUEUED");
 
         Assert.True(sampleJob.ValueKind == JsonValueKind.Object,
             "No job tagged 'devflow-sample-sync' was returned by WorkManager.");
@@ -184,6 +185,12 @@ public class DeviceTests : IntegrationTestBase
         Assert.False(string.IsNullOrWhiteSpace(sampleJob.GetProperty("identifier").GetString()));
         Assert.Contains(sampleJob.GetProperty("state").GetString(),
             new[] { "ENQUEUED", "RUNNING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED" });
+
+        var mappings = json.GetProperty("scheduledJobs").EnumerateArray();
+        var mapping = Assert.Single(mappings, m =>
+            m.GetProperty("workSpecId").GetString() == sampleJob.GetProperty("identifier").GetString());
+        Assert.True(int.TryParse(mapping.GetProperty("jobId").GetString(), out _));
+        Assert.True(mapping.GetProperty("namespace").ValueKind is JsonValueKind.String or JsonValueKind.Null);
     }
 
     [Fact]
@@ -196,7 +203,7 @@ public class DeviceTests : IntegrationTestBase
         var caps = await GetJsonAsync("/api/v1/agent/capabilities");
 
         var listSupported = jobs.GetProperty("supported").GetBoolean();
-        var capsSupported = caps.GetProperty("jobs").GetProperty("supported").GetBoolean();
+        var capsSupported = caps.GetProperty("capabilities").GetProperty("device.jobs").GetProperty("supported").GetBoolean();
 
         Assert.Equal(listSupported, capsSupported);
     }

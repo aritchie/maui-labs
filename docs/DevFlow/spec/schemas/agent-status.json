@@ -136,6 +136,10 @@
           "type": "boolean",
           "description": "Whether platform background jobs are supported by this agent."
         },
+        "menus": {
+          "type": "boolean",
+          "description": "Whether application menu inspection and invocation are supported by this agent."
+        },
         "theme": {
           "type": "boolean",
           "description": "Whether app theme endpoints are backed by an implementation."

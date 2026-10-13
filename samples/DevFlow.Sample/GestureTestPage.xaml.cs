@@ -17,6 +17,7 @@ public partial class GestureTestPage : ContentPage
     private double _panX;
     private double _panY;
     private DateTime _longPressStartedAtUtc;
+    private int _inputTapCount;
 
     // Raw-touch state. The whole sequence is summarised rather than only the last event:
     // a synthetic pinch ends on a single pointer once the others lift, so "touches" at the
@@ -84,6 +85,9 @@ public partial class GestureTestPage : ContentPage
 
     private void OnSingleTapped(object? sender, TappedEventArgs e)
         => TapStatusLabel.Text = "tap: single";
+
+    private void OnInputTapped(object? sender, TappedEventArgs e)
+        => InputTapStatusLabel.Text = $"input tap: {++_inputTapCount}";
 
     private void OnDoubleTapped(object? sender, TappedEventArgs e)
         => TapStatusLabel.Text = "tap: double";

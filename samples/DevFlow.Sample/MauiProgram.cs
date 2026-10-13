@@ -52,7 +52,7 @@ public static class MauiProgram
 				"com.example.diagnostics",
 				"Sample diagnostics extension",
 				"1.0.0",
-				new[] { "build_info", "echo" });
+				new[] { "build_info", "echo", "seed_pref" });
 
 			diagnostics.MapTool(
 				"build_info",
@@ -114,6 +114,8 @@ public static class MauiProgram
 					Idempotent = true,
 					Category = "diagnostics"
 				});
+
+			PreferenceDiagnostics.Register(diagnostics);
 		});
 		builder.AddMauiBlazorDevFlowTools();
 #endif

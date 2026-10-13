@@ -5,6 +5,7 @@ import { confirmModal } from './inspector-dialog.js';
 import { createDataSnapshot, isSecretContextKey, supportsDataContextScope } from './inspector-data-context.js';
 import { createPropertyGridController } from './inspector-properties.js';
 import { createElementTreeController } from './inspector-tree.js';
+import { createLayoutPanel, createLayoutEventTracker, layoutContextPayload, layoutRootElementId } from './inspector-layout.js';
 
 (function () {
   'use strict';
@@ -49,11 +50,10 @@ import { createElementTreeController } from './inspector-tree.js';
   let otherLeaseLabel = null;
   let otherLeaseExpiresInMs = null;
   let connected = true;   // a live app is reachable (derived from /api/state); gates the drive-actions
-  // Layout diagnostics cost a full analysis pass per frame on the agent, so state polls only ask
-  // for them while the Layout panel is open. Declared here because refreshState() runs long before
-  // the diagnostics block below is evaluated.
-  let diagnosticsPanelOpen = false;
-  const diagnosticsWanted = () => diagnosticsPanelOpen;
+  // Layout scans are explicit or opt-in live operations, independent of screenshot polling.
+  let layoutPanel = null;
+  const layoutEventTracker = createLayoutEventTracker();
+  const diagnosticsWanted = () => false;
   const _origFetch = window.fetch.bind(window);
   window.fetch = async (url, opts) => {
     if (typeof url === 'string' && url.indexOf(basePath + '/api/') === 0) {
@@ -233,8 +233,15 @@ import { createElementTreeController } from './inspector-tree.js';
           patchElements(state.elements);
           onElementsUpdated();
         }
-        if (diagnosticsPanelOpen)
-          renderDiagnostics(state.diagnostics, state.rootOffsetX || 0, state.rootOffsetY || 0);
+        latestRootOffsetX = rootOffsetX;
+        latestRootOffsetY = rootOffsetY;
+        const treeRevision = typeof state.treeRevision === 'string' ? state.treeRevision : '';
+        const diagnosticInputsRevision = typeof state.diagnosticInputsRevision === 'string'
+          ? state.diagnosticInputsRevision : null;
+        const renderedState = [...viewport.querySelectorAll('.devflow-element')].map(element =>
+          ['data-id', 'style', 'data-isVisible', 'data-isEnabled', 'data-opacity', 'data-text', 'data-value']
+            .map(attribute => element.getAttribute(attribute)));
+        layoutPanel?.frameChanged(JSON.stringify([treeRevision, diagnosticInputsRevision, renderedState]));
         return state;
       } catch (err) {
         markConnected(false);
@@ -264,6 +271,7 @@ import { createElementTreeController } from './inspector-tree.js';
     }
     if (!value) {
       disconnectReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      layoutPanel?.invalidate('App disconnected; the previous Layout snapshot is stale.');
     } else if (disconnectReturnFocus && disconnectReturnFocus.isConnected) {
       const active = document.activeElement;
       if (!active || active === document.body || active === document.documentElement ||
@@ -430,6 +438,16 @@ import { createElementTreeController } from './inspector-tree.js';
     return traits.includes('textinput') || traits.includes('editable');
   }
 
+  function canEditTextInput(el) {
+    if (!isTextInput(el) || el.getAttribute('data-isEnabled') === 'false' ||
+        el.getAttribute('data-isReadOnly') === 'true') return false;
+    // A tap recognizer may open a picker or navigate away. Drive that action, not an editor.
+    const gestures = (el.dataset.gestures || '').toLowerCase().split(',');
+    if (gestures.includes('tap')) return false;
+    const capabilities = (el.dataset.capabilities || '').toLowerCase().split(',').filter(Boolean);
+    return capabilities.length === 0 || capabilities.includes('set-value');
+  }
+
   function ensureCanDrive() {
     if (!connected) {
       setStatus(disconnectedStatus);
@@ -592,6 +610,7 @@ import { createElementTreeController } from './inspector-tree.js';
   }
 
   function openEditor(targetEl) {
+    if (!canEditTextInput(targetEl)) return;
     if (activeEditor?.dataset.commitInProgress === 'true') return;
     closeEditor(false);
     const elementId = targetEl.getAttribute('data-id');
@@ -651,6 +670,37 @@ import { createElementTreeController } from './inspector-tree.js';
     setTimeout(() => { editor.focus(); editor.select(); }, 0);
   }
 
+  function pulseActionTarget(el) {
+    if (!el || !el.classList) return;
+    el.classList.remove('df-action-target');
+    void el.offsetWidth;
+    el.classList.add('df-action-target');
+    setTimeout(() => el.classList.remove('df-action-target'), 700);
+  }
+
+  async function sendInspectorTap(x, y, targetEl) {
+    const targetId = isTapTargetOverlay(targetEl) ? targetEl.getAttribute('data-id') : null;
+    const targetLabel = targetEl ? elementLabel(targetEl) : null;
+    const payload = { x, y, ...getElementCaptureMetadata(targetEl) };
+    if (targetId) payload.elementId = targetId;
+
+    const response = await inspectorApi.postDetailed('/api/tap', payload);
+    const result = response.body;
+    if (!response.ok || !result || result.ok !== true) {
+      const reason = result && typeof result.reason === 'string'
+        ? result.reason
+        : 'The app did not accept the tap.';
+      setStatus(`Tap did not run — ${reason}`);
+      return { ok: false, result, target: targetEl };
+    }
+
+    const actual = result.elementId ? (elById(result.elementId) || targetEl) : targetEl;
+    pulseActionTarget(actual);
+    const label = actual ? elementLabel(actual) : targetLabel;
+    setStatus(label ? `Tap sent to ${label}.` : 'Tap sent to the app.');
+    return { ok: true, result, target: actual || targetEl };
+  }
+
   viewport.addEventListener('click', async (e) => {
     if (isDragging) return;
     // If the user clicks back into the active editor, ignore.
@@ -676,7 +726,9 @@ import { createElementTreeController } from './inspector-tree.js';
 
     let textEl = underCursor;
     while (textEl && textEl !== viewport && !isTextInput(textEl)) textEl = textEl.parentElement;
-    if (textEl && textEl !== viewport && isTextInput(textEl)) {
+    if (textEl && textEl !== viewport && canEditTextInput(textEl)) {
+      const { x: tx, y: ty } = toAppCoords(e.clientX, e.clientY);
+      sendInspectorTap(tx, ty, textEl).catch(err => console.error('Tap failed:', err));
       openEditor(textEl);
       return;
     }
@@ -684,22 +736,20 @@ import { createElementTreeController } from './inspector-tree.js';
     // Capture the tap target BEFORE driving (a navigation can destroy it) so a recorded step
     // carries the durable selector of the element the user targeted. We drive by coordinate (works
     // for any element, interactive or not) and record the hit element — replay resolves by selector.
-    const tapEl = underCursor && underCursor.closest ? underCursor.closest('.devflow-element') : null;
+    const tapEl = hoverHitTest(e.clientX, e.clientY) ||
+      (underCursor && underCursor.closest ? underCursor.closest('.devflow-element') : null);
     const { x, y } = toAppCoords(e.clientX, e.clientY);
 
     try {
-      const resp = await fetch(`${basePath}/api/tap`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x, y })
-      });
+      const tap = await sendInspectorTap(x, y, tapEl);
       if (recordingId) {
-        if (tapEl && resp.ok) await recordStep('tap', tapEl);
-        else if (!tapEl) setStatus('Tap not recorded — no element under the cursor.');
+        if (tap.ok && tap.target) await recordStep('tap', tap.target);
+        else if (!tap.target) setStatus('Tap not recorded — no element under the cursor.');
       }
       scheduleRefresh(400);
     } catch (err) {
       console.error('Tap failed:', err);
+      setStatus('Tap did not run — the Inspector could not reach the app.');
     }
   });
 
@@ -793,7 +843,8 @@ import { createElementTreeController } from './inspector-tree.js';
 
   // ── Live updates: a WebSocket to the broker-proxied /ws/events makes the mirror react instantly
   // to app-side changes. The 3s poll below stays as a zero-regression fallback and only refreshes
-  // when the socket is NOT live (wsLive) — so if the WS never connects, behavior is exactly as before.
+  // when the socket is NOT live (wsLive), or Layout is visible: an open event stream does not
+  // guarantee every native scroll or layout change emits an event. This poll never analyzes layout.
   let wsLive = false;
   let eventsWs = null;
   let eventConnectTimer = null;
@@ -833,21 +884,22 @@ import { createElementTreeController } from './inspector-tree.js';
       }
 
       const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + basePath + '/ws/events';
+      const layoutEventChanged = layoutEventTracker.beginConnection();
       eventsWs = new WebSocket(wsUrl);
       eventsWs.onopen = () => {
         wsLive = true;
         if (!document.hidden && !replaying) scheduleRefresh(0);
       };
       eventsWs.onmessage = (event) => {
-        // Layout-diagnostics deltas carry their own payload and are applied incrementally; every
-        // other event just means "something moved", so fall back to the debounced refresh.
-        if (typeof event.data === 'string' && event.data.includes('layout-diagnostics-delta')) {
+        if (typeof event.data === 'string') {
           try {
             const message = JSON.parse(event.data);
             if (message && message.type === 'layout-diagnostics-delta') {
               applyDiagnosticsDelta(message);
               return;
             }
+            if (layoutEventChanged(message))
+              layoutPanel?.invalidate('App evidence changed; rescan to review the current layout.');
           } catch (e) { /* not JSON we understand — fall through to a refresh */ }
         }
         if (!document.hidden && !replaying) scheduleRefresh(150);
@@ -867,9 +919,9 @@ import { createElementTreeController } from './inspector-tree.js';
     if (!eventsWs || eventsWs.readyState >= WebSocket.CLOSING) connectEvents();
   });
 
-  // ── Periodic refresh for app-side changes (AJAX, no flash) — fallback when the WS isn't live ──
+  // ── Periodic safety refresh for app-side changes (AJAX, no flash) ──
   let pollInterval = setInterval(() => {
-    if (!document.hidden && !refreshTimer && !wsLive) {
+    if (!document.hidden && !refreshTimer && (!wsLive || isDiagnosticsPaneVisible())) {
       refreshState();
     }
   }, 3000);
@@ -881,7 +933,7 @@ import { createElementTreeController } from './inspector-tree.js';
     } else if (!pollInterval) {
       if (!replaying) scheduleRefresh(0);
       pollInterval = setInterval(() => {
-        if (!refreshTimer && !wsLive) refreshState();
+        if (!refreshTimer && (!wsLive || isDiagnosticsPaneVisible())) refreshState();
       }, 3000);
     }
   });
@@ -923,6 +975,7 @@ import { createElementTreeController } from './inspector-tree.js';
     onClose: () => restoreFocus(propsReturnFocus, tb && tb.tree),
     onRuntimeChange: ({ elementId, name, value }) => {
       if (recordingId) recordStep('setProperty', elById(elementId), { name, value });
+      layoutPanel?.invalidate('An app property changed; the previous Layout snapshot is stale.');
       scheduleRefresh(200);
     },
   });
@@ -1095,6 +1148,12 @@ import { createElementTreeController } from './inspector-tree.js';
     if (!open && restore) restoreFocus(tb.more);
   }
 
+  function isDiagnosticsPaneVisible() {
+    return document.body.classList.contains('df-dock-open') &&
+      !document.body.classList.contains('df-dock-collapsed') &&
+      document.getElementById('df-tab-layout')?.getAttribute('aria-selected') === 'true';
+  }
+
   function syncPaneChrome() {
     const propsOpen = !!propsPaneEl && !propsPaneEl.classList.contains('df-hidden');
     const treeOpen = !document.body.classList.contains('df-tree-hidden');
@@ -1105,6 +1164,10 @@ import { createElementTreeController } from './inspector-tree.js';
       (hostLayout !== 'wide' && dockOpen);
     document.body.classList.toggle('df-props-open', propsOpen);
     if (paneScrim) paneScrim.classList.toggle('df-hidden', !showScrim);
+    const layoutVisible = isDiagnosticsPaneVisible();
+    const layoutToggle = document.getElementById('df-toggle-diagnostics');
+    layoutToggle?.setAttribute('aria-expanded', String(layoutVisible));
+    layoutToggle?.classList.toggle('df-active', layoutVisible);
   }
 
   function updateHostLayout() {
@@ -1278,40 +1341,43 @@ import { createElementTreeController } from './inspector-tree.js';
   }
   function setHover(el) {
     if (hoveredEl === el) return;
-    if (hoveredEl) hoveredEl.classList.remove('df-hover', 'df-hover-noninteractive');
+    if (hoveredEl) hoveredEl.classList.remove('df-hover', 'df-hover-noninteractive', 'df-hover-interactive');
     hoveredEl = el;
     if (!el) { if (badgeEl) badgeEl.style.display = 'none'; return; }
     el.classList.add('df-hover');
     const interactable = isInteractableOverlay(el);
+    const tapTarget = isTapTargetOverlay(el);
     el.classList.toggle('df-hover-noninteractive', !interactable);
+    el.classList.toggle('df-hover-interactive', tapTarget);
     const b = ensureBadge();
     b.classList.toggle('df-badge-noninteractive', !interactable);
+    const kind = tapTarget
+      ? 'Interactive element'
+      : (interactable ? 'Scrollable element' : 'Visual element');
+    b.dataset.kind = tapTarget ? 'interactive' : (interactable ? 'scrollable' : 'visual');
     const w = Math.round(parseFloat(el.style.width) || el.offsetWidth);
     const h = Math.round(parseFloat(el.style.height) || el.offsetHeight);
-    b.textContent = (el.getAttribute('data-type') || 'Element') + ' ' + w + '×' + h;
-    b.style.left = el.offsetLeft + 'px';
-    b.style.top = Math.max(0, el.offsetTop - 18) + 'px';
+    b.textContent = `${kind}: ${el.getAttribute('data-type') || 'Element'} ${w}×${h}`;
     b.style.display = 'block';
+    const viewportWidth = parseFloat(viewport.dataset.width) || viewport.offsetWidth || 0;
+    const viewportHeight = parseFloat(viewport.dataset.height) || viewport.offsetHeight || 0;
+    const maxLeft = Math.max(0, viewportWidth - b.offsetWidth);
+    const maxTop = Math.max(0, viewportHeight - b.offsetHeight);
+    b.style.left = Math.min(Math.max(0, el.offsetLeft), maxLeft) + 'px';
+    b.style.top = Math.min(Math.max(0, el.offsetTop - b.offsetHeight - 2), maxTop) + 'px';
   }
   function isInteractableOverlay(el) {
     if (!el || !el.classList || !el.classList.contains('devflow-element')) return false;
     return el.dataset.interactable === 'true';
   }
+  function isTapTargetOverlay(el) {
+    if (!isInteractableOverlay(el)) return false;
+    return (el.dataset.traits || '').split(',')
+      .some((trait) => trait.trim().toLowerCase() === 'interactive');
+  }
   function hoverHitTest(clientX, clientY) {
-    const nodes = mode === 'interact'
-      ? document.elementsFromPoint(clientX, clientY)
-      : [document.elementFromPoint(clientX, clientY)];
-    const seen = new Set();
-    let nonInteractiveFallback = null;
-    for (const node of nodes) {
-      const overlay = (node && node.closest) ? node.closest('.devflow-element') : null;
-      if (!overlay || seen.has(overlay)) continue;
-      seen.add(overlay);
-      if (mode !== 'interact') return overlay;
-      if (isInteractableOverlay(overlay)) return overlay;
-      nonInteractiveFallback ??= overlay;
-    }
-    return nonInteractiveFallback;
+    const node = document.elementFromPoint(clientX, clientY);
+    return node && node.closest ? node.closest('.devflow-element') : null;
   }
   viewport.addEventListener('pointermove', (e) => {
     if (isGesturing || activeEditor) return;
@@ -1322,7 +1388,9 @@ import { createElementTreeController } from './inspector-tree.js';
   // ── Selection: screenshot ↔ tree ↔ property grid ──
   function selectElement(id) {
     viewport.querySelectorAll('.devflow-element.df-selected').forEach((el) => el.classList.remove('df-selected'));
+    const previousId = selectedId;
     selectedId = id || null;
+    if (previousId !== selectedId) layoutPanel?.selectionChanged();
     if (!id) { propertyGrid.close(); elementTree.updateSelection(); setStatus(''); updateHostButtons(); updateFlowButtons(); postSelectionToHost(null); return; }
     const el = elById(id);
     if (el) el.classList.add('df-selected');
@@ -1790,7 +1858,7 @@ import { createElementTreeController } from './inspector-tree.js';
     updateFlowButtons();
     // Pause the 3s poll while replaying so the screenshot doesn't churn under the driven app.
     if (on && pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-    else if (!on && !pollInterval) { pollInterval = setInterval(() => { if (!refreshTimer && !wsLive) refreshState(); }, 3000); }
+    else if (!on && !pollInterval) { pollInterval = setInterval(() => { if (!refreshTimer && (!wsLive || isDiagnosticsPaneVisible())) refreshState(); }, 3000); }
   }
 
   async function captureCheckpoint(label) {
@@ -2025,7 +2093,10 @@ import { createElementTreeController } from './inspector-tree.js';
         body: JSON.stringify({ elementId: id }),
       });
       const j = r.ok ? await r.json().catch(() => null) : null;
-      if (!j || !j.ok || !j.file) { setStatus('No source available for this element.'); return; }
+      if (!j || !j.ok || !j.file) {
+        setStatus((j && j.error) || 'No source available for this element.');
+        return;
+      }
       if (hostHas('openSource') && postToHost('devflow:openSource', {
         file: j.file,
         line: j.line || 1,
@@ -2101,8 +2172,11 @@ import { createElementTreeController } from './inspector-tree.js';
       if (hostHas('copilotContext')) {
         setStatus(`Adding ${kind === 'combined' ? 'selection and workflow' : kind} context to Copilot…`);
         const result = await requestHost('devflow:attachCopilot', { context: kind, payload }, 10000);
-        setStatus(result && result.ok
+        const successMessage = result && result.ok
           ? (result.message || 'Added Inspector context to Copilot.')
+          : null;
+        setStatus(result && result.ok
+          ? `${successMessage} Copilot can request mutation control with maui_take_control.`
           : ((result && result.error) || 'The host could not add Inspector context to Copilot.'));
         return;
       }
@@ -2285,7 +2359,8 @@ import { createElementTreeController } from './inspector-tree.js';
       setStatus(`Adding ${dockSnapshot.title} to Copilot…`);
       const result = await requestHost('devflow:attachData', { snapshot: dockSnapshot }, 12000);
       setStatus(result.ok
-        ? (result.message || `Added ${dockSnapshot.title} to Copilot.`)
+        ? `${result.message || `Added ${dockSnapshot.title} to Copilot.`} ` +
+          'Copilot can request mutation control with maui_take_control.'
         : (result.error || `Could not add ${dockSnapshot.title} to Copilot.`));
       return;
     }
@@ -2742,6 +2817,9 @@ import { createElementTreeController } from './inspector-tree.js';
   }
 
   const tabLoaders = {
+    layout: async () => {
+      if (isDiagnosticsPaneVisible()) layoutPanel?.activate(dockBodyEl);
+    },
     logs: async (generation) => {
       const j = await apiPost('/api/logs', { limit: 200 });
       if (dockLoadIsCurrent('logs', generation)) renderLogs(j);
@@ -2889,6 +2967,7 @@ import { createElementTreeController } from './inspector-tree.js';
   }
 
   async function loadTab(name) {
+    layoutPanel?.deactivate();
     const generation = ++dockViewGeneration;
     dockActiveTab = name;
     networkDetailId = null;
@@ -2900,12 +2979,14 @@ import { createElementTreeController } from './inspector-tree.js';
       b.tabIndex = active ? 0 : -1;
       if (active && b.id) dockBodyEl.setAttribute('aria-labelledby', b.id);
     }
+    syncPaneChrome();
     dockEmpty('Loading…');
     setDockMeta('loading…');
     try {
       await tabLoaders[name](generation);
       if (!dockLoadIsCurrent(name, generation)) return;
-      setDockMeta((name === 'network' ? 'live · updated ' : 'captured ') + new Date().toLocaleTimeString());
+      setDockMeta(name === 'layout' ? 'explicit scan / opt-in live' :
+        (name === 'network' ? 'live · updated ' : 'captured ') + new Date().toLocaleTimeString());
     }
     catch (e) {
       if (!dockLoadIsCurrent(name, generation)) return;
@@ -2934,9 +3015,11 @@ import { createElementTreeController } from './inspector-tree.js';
       toggleDockBtn.setAttribute('aria-pressed', 'true');
     }
     if (!dockLoaded) { dockLoaded = true; loadTab(dockActiveTab); }
+    else if (dockActiveTab === 'layout') layoutPanel?.activate(dockBodyEl);
     syncPaneChrome();
   }
   function closeDock(restore = false) {
+    layoutPanel?.deactivate();
     dockEl.classList.add('df-hidden');
     document.body.classList.remove('df-dock-open', 'df-dock-collapsed');
     if (toggleDockBtn) {
@@ -2948,16 +3031,22 @@ import { createElementTreeController } from './inspector-tree.js';
   }
   function toggleDockCollapsed() {
     const collapsed = document.body.classList.toggle('df-dock-collapsed');
+    if (dockActiveTab === 'layout') {
+      if (collapsed) layoutPanel?.deactivate();
+      else layoutPanel?.activate(dockBodyEl);
+    }
     if (dockCollapseBtn) {
       dockCollapseBtn.setAttribute('aria-expanded', String(!collapsed));
       dockCollapseBtn.title = collapsed ? 'Expand data panel' : 'Collapse data panel';
     }
+    syncPaneChrome();
   }
   if (toggleDockBtn) toggleDockBtn.addEventListener('click', () => (dockEl.classList.contains('df-hidden') ? openDock() : closeDock()));
   if (dockCloseBtn) dockCloseBtn.addEventListener('click', () => closeDock(true));
   if (dockCollapseBtn) dockCollapseBtn.addEventListener('click', toggleDockCollapsed);
   if (dockRefreshBtn) dockRefreshBtn.addEventListener('click', () => {
-    if (dockActiveTab === 'network' && networkDetailId) loadNetworkDetail(networkDetailId);
+    if (dockActiveTab === 'layout') layoutPanel?.refresh();
+    else if (dockActiveTab === 'network' && networkDetailId) loadNetworkDetail(networkDetailId);
     else loadTab(dockActiveTab);
   });
   if (attachDataBtn) attachDataBtn.addEventListener('click', attachDockDataToCopilot);
@@ -3108,6 +3197,7 @@ import { createElementTreeController } from './inspector-tree.js';
     const dw = parseFloat(viewport.dataset.width) || viewport.offsetWidth || 1;
     const dh = parseFloat(viewport.dataset.height) || viewport.offsetHeight || 1;
     if (!stage || !vpWrap) return;
+    vpWrap.classList.toggle('df-fit-active', fitMode);
     let s = 1;
     if (fitMode) {
       const availW = vpWrap.clientWidth, availH = vpWrap.clientHeight;
@@ -3184,113 +3274,83 @@ import { createElementTreeController } from './inspector-tree.js';
   applyScale();
 
 
-  // ── Layout diagnostics (ported from #412) ──────────────────────────────────
-  // The panel and overlay markup live in inspector.html using the df-* design; the logic below
-  // is #412's, rebound to those elements. Findings arrive on /api/state paired with the frame's
-  // tree revision, and incrementally over the event stream as diagnostics deltas.
+  // Layout dock: the original list/detail/coverage UX over the current report contract.
   const diagnosticsPane = document.getElementById('df-diagnostics-pane');
-  const diagnosticsList = document.getElementById('diagnostics-list');
-  const diagnosticsSummary = document.getElementById('diagnostics-summary');
-  const diagnosticsCoverage = document.getElementById('diagnostics-coverage');
-  const diagnosticsFilter = document.getElementById('diagnostics-filter');
-  const diagnosticsSeverity = document.getElementById('diagnostics-severity');
-  const diagnosticsConfidence = document.getElementById('diagnostics-confidence');
-  const diagnosticsRule = document.getElementById('diagnostics-rule');
-  const diagnosticsSuppressed = document.getElementById('diagnostics-suppressed');
   const diagnosticOverlays = document.getElementById('diagnostic-overlays');
   const diagnosticsToggle = document.getElementById('df-toggle-diagnostics');
-  const diagnosticsClose = document.getElementById('df-diagnostics-close');
 
   let latestDiagnostics = null;
   let latestRootOffsetX = 0;
   let latestRootOffsetY = 0;
-  const severityRanks = { info: 0, minor: 1, moderate: 2, serious: 3, critical: 4 };
-  const confidenceRanks = { low: 0, medium: 1, high: 2, exact: 3 };
-
-  function renderDiagnostics(diagnostics, rootOffsetX, rootOffsetY) {
-    latestDiagnostics = diagnostics || null;
-    latestRootOffsetX = rootOffsetX;
-    latestRootOffsetY = rootOffsetY;
-    if (!diagnosticsList || !diagnosticsSummary || !diagnosticOverlays) return;
-
-    diagnosticsList.replaceChildren();
-    diagnosticOverlays.replaceChildren();
-    clearDiagnosticHighlights();
-
-    if (!diagnostics) {
-      diagnosticsSummary.textContent = 'Unavailable';
-      if (diagnosticsCoverage) diagnosticsCoverage.textContent = 'The connected agent does not provide layout diagnostics.';
-      return;
-    }
-
-    const summary = diagnostics.summary || {};
-    diagnosticsSummary.textContent =
-      `${summary.violations || 0} violations, ${summary.observations || 0} observations, ` +
-      `${summary.incomplete || 0} incomplete, ${summary.passes || 0} passes, ` +
-      `${summary.notApplicable || 0} n/a, ${summary.suppressed || 0} suppressed`;
-    const limitations = diagnostics.coverage?.limitations || [];
-    if (diagnosticsCoverage) {
-      diagnosticsCoverage.textContent = limitations.length
-        ? limitations.slice(0, 3).join(' ')
-        : `Coverage: ${diagnostics.coverage?.overall || 'unknown'}`;
-    }
-
-    const outcomeFilter = diagnosticsFilter?.value || 'actionable';
-    const severityFilter = diagnosticsSeverity?.value || 'all';
-    const confidenceFilter = diagnosticsConfidence?.value || 'all';
-    const ruleFilter = (diagnosticsRule?.value || '').trim().toLowerCase();
-    const includeSuppressed = diagnosticsSuppressed?.checked === true;
-    const findings = (diagnostics.findings || []).filter(finding => {
-      if (finding.suppressed && !includeSuppressed) return false;
-      if (outcomeFilter === 'incomplete' && finding.outcome !== 'incomplete') return false;
-      if (outcomeFilter === 'passes' && finding.outcome !== 'pass') return false;
-      if (outcomeFilter === 'actionable' && finding.outcome !== 'violation' && finding.outcome !== 'incomplete') return false;
-      if (severityFilter !== 'all' &&
-          (severityRanks[finding.severity || 'info'] || 0) < severityRanks[severityFilter]) return false;
-      if (confidenceFilter !== 'all' &&
-          (confidenceRanks[finding.confidence || 'low'] || 0) < confidenceRanks[confidenceFilter]) return false;
-      if (ruleFilter && !(finding.ruleId || '').toLowerCase().includes(ruleFilter)) return false;
-      return true;
-    });
-
-    for (const finding of findings) {
-      const item = document.createElement('div');
-      item.className = 'diagnostic-item';
-      item.tabIndex = 0;
-      item.setAttribute('role', 'button');
-
-      const title = document.createElement('div');
-      title.className = 'diagnostic-item-title';
-      const rule = document.createElement('span');
-      rule.textContent = finding.ruleId || 'layout finding';
-      const severity = document.createElement('span');
-      severity.className = `severity-${finding.severity || 'info'}`;
-      severity.textContent = `${(finding.severity || 'info').toUpperCase()} · ${finding.confidence || 'unknown'}`;
-      title.append(rule, severity);
-
-      const message = document.createElement('div');
-      message.className = 'diagnostic-item-message';
-      message.textContent = finding.message || '';
-
-      const element = document.createElement('div');
-      element.className = 'diagnostic-item-element';
-      const elementRef = finding.element || {};
-      element.textContent = `${elementRef.type || 'Element'}#${elementRef.automationId || elementRef.id || '?'}`;
-
-      item.append(title, message, element);
-      addSourceLink(item, elementRef);
-      addRelatedElements(item, finding.relatedElements || []);
-      addDiagnosticActions(item, finding);
-      item.addEventListener('click', () => selectDiagnosticFinding(finding, rootOffsetX, rootOffsetY));
-      item.addEventListener('keydown', event => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          selectDiagnosticFinding(finding, rootOffsetX, rootOffsetY);
-        }
+  layoutPanel = createLayoutPanel({
+    document,
+    scan: async options => {
+      const result = await inspectorApi.postDetailed('/api/diagnostics/layout', options);
+      if (!result.ok) throw new Error(result.body?.error || result.body?.message || result.error ||
+        `Layout scan failed (HTTP ${result.status}).`);
+      return result.body;
+    },
+    selection: () => selectedId,
+    defaultRoot: () => layoutRootElementId([...viewport.querySelectorAll('.devflow-element')].map(element => ({
+      id: element.getAttribute('data-id'),
+      type: element.getAttribute('data-type'),
+      parentId: element.getAttribute('data-parentId'),
+      isVisible: element.getAttribute('data-isVisible') !== 'false',
+    }))),
+    status: setStatus,
+    show: finding => {
+      diagnosticOverlays.replaceChildren();
+      clearDiagnosticHighlights();
+      if (finding) selectDiagnosticFinding(finding, rootOffsetX, rootOffsetY);
+    },
+    hasSource: finding => elById(finding.element?.id)?.getAttribute('data-hasSource') === 'true',
+    openSource: async finding => {
+      const target = elById(finding.element?.id);
+      if (!target || target.getAttribute('data-hasSource') !== 'true') {
+        setStatus('Source mapping is no longer available for this element. Rescan first.');
+        return;
+      }
+      selectElement(finding.element.id);
+      await openSource();
+    },
+    copy: async (report, id, attach, stale) => {
+      recordDockSnapshot('layout', id ? 'Selected Layout finding' : 'Layout diagnostics',
+        layoutContextPayload(report, id), id ? 1 : report.findings.length,
+        { stale: !!stale, snapshotCapturedAt: report.snapshot?.capturedAt });
+      if (attach) await attachDockDataToCopilot();
+      else {
+        const ok = await copyText(JSON.stringify(dockSnapshot, null, 2));
+        setStatus(ok ? 'Copied bounded Layout context.' : 'Could not copy Layout context.');
+      }
+    },
+    suppress: async (finding, policyFilePath) => {
+      if (!policyFilePath) {
+        setStatus('Layout suppressions require the inspected project\'s full path.');
+        return false;
+      }
+      if (!await confirmModal(
+        `${finding.suppressed ? 'Remove' : 'Save'} this Layout suppression?\nThis changes ${policyFilePath}`,
+        finding.suppressed ? 'Remove suppression' : 'Save suppression')) return false;
+      const result = await inspectorApi.postDetailed(`/api/diagnostics/${finding.suppressed ? 'unsuppress' : 'suppress'}`, {
+        findingId: finding.id,
+        reason: finding.suppressed ? null : 'Reviewed in DevFlow Inspector',
+        policyFilePath,
       });
-      diagnosticsList.appendChild(item);
-    }
-  }
+      if (!result.ok || result.body?.success !== true) {
+        setStatus(result.body?.error || result.body?.message || result.error || 'The Layout policy could not be changed.');
+        return false;
+      }
+      return true;
+    },
+    changed: (report, stale) => {
+      latestDiagnostics = report;
+      const tab = document.getElementById('df-tab-layout');
+      if (tab) tab.textContent = report ? `Layout (${report.summary?.violations || 0})` : 'Layout';
+      if (dockActiveTab !== 'layout') return;
+      if (!report || stale) clearDockSnapshot();
+      else recordDockSnapshot('layout', 'Layout diagnostics', layoutContextPayload(report), report.findings.length);
+    },
+  });
 
   function selectDiagnosticFinding(finding, rootOffsetX, rootOffsetY) {
     diagnosticOverlays.replaceChildren();
@@ -3301,6 +3361,7 @@ import { createElementTreeController } from './inspector-tree.js';
 
     addDiagnosticRegion(finding.evidence?.fullRegion, 'diagnostic-region-full', rootOffsetX, rootOffsetY);
     addDiagnosticRegion(finding.evidence?.visibleRegion, 'diagnostic-region-visible', rootOffsetX, rootOffsetY);
+    addDiagnosticRegion(finding.evidence?.parentRegion, 'diagnostic-region-parent', rootOffsetX, rootOffsetY);
     for (const clip of finding.evidence?.clipChain || [])
       addDiagnosticRegion(clip.region, 'diagnostic-region-clip', rootOffsetX, rootOffsetY);
     addDiagnosticRegion(finding.evidence?.overlap?.intersectionRegion, 'diagnostic-region-overlap', rootOffsetX, rootOffsetY);
@@ -3360,76 +3421,6 @@ import { createElementTreeController } from './inspector-tree.js';
     }
   }
 
-  function addSourceLink(item, element) {
-    if (!element?.sourceFile) return;
-    const link = document.createElement('a');
-    link.className = 'diagnostic-source';
-    const normalized = element.sourceFile.replace(/\\/g, '/');
-    link.href = `vscode://file/${encodeURI(normalized)}:${element.sourceLine || 1}:${element.sourceColumn || 1}`;
-    link.textContent = `Source ${element.sourceLine || '?'}`;
-    link.addEventListener('click', event => event.stopPropagation());
-    item.appendChild(link);
-  }
-
-  function addRelatedElements(item, relatedElements) {
-    if (!relatedElements.length) return;
-    const container = document.createElement('div');
-    container.className = 'diagnostic-related';
-    for (const related of relatedElements) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = `${related.relation}: ${related.element?.automationId || related.element?.id || '?'}`;
-      button.addEventListener('click', event => {
-        event.stopPropagation();
-        clearDiagnosticHighlights();
-        highlightElement(related.element?.id, 'diagnostic-related-highlight', true);
-      });
-      container.appendChild(button);
-    }
-    item.appendChild(container);
-  }
-
-  function addDiagnosticActions(item, finding) {
-    const actions = document.createElement('div');
-    actions.className = 'diagnostic-item-actions';
-    const suppress = document.createElement('button');
-    suppress.type = 'button';
-    suppress.textContent = finding.suppressed ? 'Unsuppress' : 'Suppress';
-    suppress.addEventListener('click', async event => {
-      event.stopPropagation();
-      const endpoint = finding.suppressed ? 'unsuppress' : 'suppress';
-      const response = await fetch(`${basePath}/api/diagnostics/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ findingId: finding.id })
-      });
-      if (!response.ok) {
-        const error = await response.json().catch(() => null);
-        suppress.textContent = 'Policy conflict';
-        suppress.title = error?.message || 'The suppression policy could not be changed.';
-        return;
-      }
-      scheduleRefresh(50);
-    });
-
-    const copy = document.createElement('button');
-    copy.type = 'button';
-    copy.textContent = 'Copy agent payload';
-    copy.addEventListener('click', async event => {
-      event.stopPropagation();
-      const response = await fetch(`${basePath}/api/diagnostics/agent-payload`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ findingId: finding.id })
-      });
-      if (!response.ok) return;
-      const text = await response.text();
-      await navigator.clipboard?.writeText(text);
-    });
-    actions.append(suppress, copy);
-    item.appendChild(actions);
-  }
-
   function clearDiagnosticHighlights() {
     viewport.querySelectorAll('.diagnostic-selected, .diagnostic-related-highlight')
       .forEach(element => {
@@ -3448,68 +3439,21 @@ import { createElementTreeController } from './inspector-tree.js';
       target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
   }
 
-  for (const control of [
-    diagnosticsFilter,
-    diagnosticsSeverity,
-    diagnosticsConfidence,
-    diagnosticsSuppressed
-  ]) {
-    control?.addEventListener('change', () =>
-      renderDiagnostics(latestDiagnostics, latestRootOffsetX, latestRootOffsetY));
-  }
-  diagnosticsRule?.addEventListener('input', () =>
-    renderDiagnostics(latestDiagnostics, latestRootOffsetX, latestRootOffsetY));
-
   function applyDiagnosticsDelta(delta) {
-    if (!latestDiagnostics) {
-      scheduleRefresh(50);
-      return;
-    }
-    const renderedTreeRevision = latestDiagnostics.snapshot?.treeRevision || '';
-    const deltaTreeRevision = delta.snapshot?.treeRevision || '';
-    if (renderedTreeRevision && deltaTreeRevision &&
-        renderedTreeRevision !== deltaTreeRevision) {
-      scheduleRefresh(50);
-      return;
-    }
-
-    const findings = new Map(
-      (latestDiagnostics.findings || []).map(finding => [finding.id, finding]));
-    for (const id of delta.removed || [])
-      findings.delete(id);
-    for (const finding of [...(delta.added || []), ...(delta.updated || [])])
-      findings.set(finding.id, finding);
-
-    latestDiagnostics = {
-      ...latestDiagnostics,
-      snapshot: delta.snapshot || latestDiagnostics.snapshot,
-      summary: delta.summary || latestDiagnostics.summary,
-      coverage: delta.coverage || latestDiagnostics.coverage,
-      findings: [...findings.values()]
-    };
-    renderDiagnostics(
-      latestDiagnostics,
-      latestRootOffsetX,
-      latestRootOffsetY);
+    if (delta) layoutPanel?.invalidate('Layout evidence changed. Rescan to review the current report.');
   }
 
   function setDiagnosticsPaneVisible(visible) {
-    if (!diagnosticsPane) return;
-    diagnosticsPane.classList.toggle('df-hidden', !visible);
-    diagnosticsToggle?.setAttribute('aria-expanded', String(visible));
-    diagnosticsToggle?.classList.toggle('df-active', visible);
-    diagnosticsPanelOpen = visible;
     if (visible) {
-      // Pull findings immediately rather than waiting for the next poll — the previous state
-      // responses carried none, because nothing was asking for them.
-      scheduleRefresh(0);
+      const loadLayout = dockActiveTab !== 'layout';
+      dockLoaded = true;
+      openDock();
+      if (loadLayout) loadTab('layout');
     } else {
-      clearDiagnosticHighlights();
-      latestDiagnostics = null;
+      closeDock(true);
     }
   }
   diagnosticsToggle?.addEventListener('click', () =>
-    setDiagnosticsPaneVisible(diagnosticsPane?.classList.contains('df-hidden')));
-  diagnosticsClose?.addEventListener('click', () => setDiagnosticsPaneVisible(false));
+    setDiagnosticsPaneVisible(!isDiagnosticsPaneVisible()));
 
 })();

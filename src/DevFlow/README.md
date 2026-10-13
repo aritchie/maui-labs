@@ -12,7 +12,7 @@ the agent was split away from MAUI, for plain .NET Android, iOS, Mac Catalyst an
 | **Microsoft.Maui.DevFlow.Agent** | In-app agent for .NET MAUI apps. Exposes visual tree, element interactions, screenshots, and profiling via HTTP/JSON API. |
 | **Microsoft.Maui.DevFlow.Agent.Abstractions** | The protocol itself: HTTP server, routing, element DTOs, CSS selector engine, network capture, profiling, extensions. No MAUI dependency. |
 | **Microsoft.Maui.DevFlow.Agent.Core** | The MAUI UI backend: visual tree walker, `VisualElement` interactions, `BindableProperty` access, Essentials endpoints. |
-| **Microsoft.Maui.DevFlow.Agent.Gtk** | GTK/Linux agent for Maui.Gtk apps. |
+| **Microsoft.Maui.DevFlow.Agent.Gtk** | GTK/Linux agent for Microsoft.Maui.Platforms.Linux.Gtk4 apps. |
 | **Microsoft.Maui.DevFlow.Agent.Native** | In-app agent for plain .NET apps with no MAUI reference — Android views, UIKit, and AppKit backends. |
 | **Microsoft.Maui.DevFlow.Agent.Native.Essentials** | Optional add-on that lights up the device, storage and sensor endpoints for native apps using MAUI Essentials. |
 | **Microsoft.Maui.DevFlow.Blazor** | Blazor WebView CDP bridge. Enables Chrome DevTools Protocol access for Blazor Hybrid content via Chobitsu. |
@@ -23,6 +23,93 @@ the agent was split away from MAUI, for plain .NET Android, iOS, Mac Catalyst an
 | **Microsoft.Maui.DevFlow.Logging** | Buffered rotating JSONL file logger. No MAUI dependency. |
 
 ## Quick Start
+
+### NativeAOT and trimming
+
+The agent's built-in HTTP requests/responses, broker registration and lease/recording
+messages, and WebSocket envelopes use source-generated JSON metadata. They do not
+require `JsonSerializerIsReflectionEnabledByDefault=true`. The same contracts run
+in reflection-disabled trimmed JIT applications. MAUI-specific JSON metadata is
+registered by `Agent.Core`; `Agent.Abstractions` remains MAUI-free.
+
+Custom extension payloads can use string-keyed dictionaries, sequences, primitive
+values, `JsonElement`, `JsonNode`, or `JsonDocument` without additional registration. For custom CLR
+request/response types, register a source-generated context before serving requests:
+
+```csharp
+using System.Text.Json.Serialization;
+using Microsoft.Maui.DevFlow.Agent.Core;
+
+AgentJson.RegisterContext(MyExtensionJsonContext.Default);
+
+// Existing extension handlers can still use request.BodyAs<MyRequest>() and
+// HttpResponse.Json(new MyResponse(...)).
+[JsonSerializable(typeof(MyRequest))]
+[JsonSerializable(typeof(MyResponse))]
+internal partial class MyExtensionJsonContext : JsonSerializerContext;
+```
+
+Include concrete types used inside `object`-typed members in that context too.
+Unregistered types fail with an explicit metadata error when JSON reflection is
+disabled; HTTP handlers report `500` with reason `json-metadata-missing` rather
+than dropping the connection or silently serializing an empty object. Reflection-enabled
+hosts retain the existing arbitrary-object serialization behavior. No existing
+public method signatures or wire field names changed.
+
+The default System.Text.Json object converter remains in use. Registered polymorphic
+base/derived contracts retain their discriminators, and member-level
+`JsonNumberHandling` applies to boxed numbers and values inside dynamic collections.
+Generated STJ sequence and dictionary ancestor contracts use native element
+traversal, including the containing member's settings. Registered converters take
+precedence.
+
+Custom collection types with multiple unrelated dictionary interfaces can have
+ambiguous STJ ancestor metadata. Register the concrete collection type in a
+source-generated context in that case. Unsupported JSON contracts return `500`
+with reason `json-serialization-unsupported` and the original diagnostic; missing
+metadata continues to use `json-metadata-missing`. These errors do not silently
+change a dictionary into an array or close the connection without a response.
+
+Common MAUI controls retain the public property accessors and bindable-property
+fields needed by the inspector. For custom controls or custom objects reached
+through a property path, opt in to preserving just that type's inspection contract:
+
+```csharp
+MauiAgentInspection.RegisterType<MyCustomControl>();
+MauiAgentInspection.RegisterType<MyCustomPropertyObject>();
+```
+
+This is not a guarantee that every reflection-based feature is trim-safe.
+Automatic `[DevFlowAction]` assembly scanning, arbitrary generic/async method
+invocation, custom `TypeConverter` discovery, the legacy reflection-only Comet
+adapter, and native-handler reflection fallbacks still need application-specific
+metadata/code preservation. Their linker warnings are not suppressed. Prefer
+explicit extension routes with generated JSON contracts for AOT applications.
+Platform screenshots, native injection, and device/Essentials APIs additionally
+require verification on the target platform; the host smoke below does not render
+a native UI.
+
+The DevFlow PR workflow publishes and runs both the agent smoke (including the
+headless MAUI backend) and the standalone logging smoke as Native AOT executables
+on Linux.
+
+The standalone smoke starts only its own loopback agent and broker fixtures. It
+checks reflection-disabled HTTP/broker/WebSocket serialization and the core UI
+transport contracts. Optional MAUI checks exercise real headless MAUI tree walking,
+tap, property read/write, descriptors, and custom-type registration:
+
+```bash
+dotnet run --project src/DevFlow/Microsoft.Maui.DevFlow.Agent.AotSmoke \
+  -p:IncludeMauiBackend=true -- .artifacts/devflow-aot/jit
+
+# Use the host RID (osx-arm64 shown). AotSmoke sets PublishAot only on the
+# executable, not on its netstandard analyzer dependency.
+dotnet publish src/DevFlow/Microsoft.Maui.DevFlow.Agent.AotSmoke \
+  -c Release -r osx-arm64 -p:AotSmoke=true -p:IncludeMauiBackend=true \
+  -p:TrimmerSingleWarn=false -o .artifacts/devflow-aot/native
+.artifacts/devflow-aot/native/Microsoft.Maui.DevFlow.Agent.AotSmoke \
+  .artifacts/devflow-aot/native-evidence
+```
 
 ### 1. Install the NuGet packages
 
@@ -58,6 +145,58 @@ builder.AddMauiDevFlowAgent(options =>
     options.EnableLayoutDiagnostics = true;
 });
 ```
+
+### GTK/Linux apps
+
+Use `Microsoft.Maui.DevFlow.Agent.Gtk` instead of the standard agent package with
+`Microsoft.Maui.Platforms.Linux.Gtk4`. For Blazor Hybrid, use
+`Microsoft.Maui.DevFlow.Blazor.Gtk` alongside `Microsoft.Maui.Platforms.Linux.Gtk4.BlazorWebView`.
+These packages use the in-repo GTK backend; remove superseded `Platform.Maui.Linux.Gtk4*`
+package references when migrating. Mixing the two backends is not supported.
+
+```csharp
+using Microsoft.Maui.DevFlow.Agent.Gtk;
+using Microsoft.Maui.Platforms.Linux.Gtk4.Hosting;
+
+// In CreateMauiApp:
+builder.UseMauiAppLinuxGtk4<App>();
+#if DEBUG
+builder.AddMauiDevFlowAgent();
+#endif
+```
+
+`AddMauiDevFlowAgent` starts the agent automatically on the GTK thread when the first
+window is created, after `GtkMauiApplication` has initialized the MAUI application and its
+handler. No manual startup call is required. Hosts needing an explicit startup hook can call
+the extension from `OnStarted` (not `CreateMauiApp`, which is too early):
+
+```csharp
+using Microsoft.Maui.DevFlow.Agent.Gtk;
+using Microsoft.Maui.Hosting;
+using Microsoft.Maui.Platforms.Linux.Gtk4.Platform;
+
+public class Program : GtkMauiApplication
+{
+    protected override MauiApp CreateMauiApp() => MauiProgram.CreateMauiApp();
+
+    protected override void OnStarted()
+    {
+        base.OnStarted();
+#if DEBUG
+        this.StartDevFlowAgent();
+#endif
+    }
+}
+```
+
+The explicit hook still requires builder registration. Calling it before initialization or
+without registering the agent reports an error instead of silently doing nothing.
+Use `maui devflow list` to discover the assigned port rather than assuming port 9223.
+
+For Blazor Hybrid, register `builder.AddMauiBlazorDevFlowTools()` from
+`Microsoft.Maui.DevFlow.Blazor.Gtk` as well. CDP wiring and WebView discovery start on the
+same initialized window lifecycle, even if application startup takes more than two seconds.
+Later windows and explicit `WireBlazorCdpToAgent()` calls do not duplicate registrations.
 
 ### 2b. Or, in a plain .NET app (no MAUI)
 
@@ -193,6 +332,7 @@ For local debugging that needs full-path project disambiguation, opt in explicit
 - **Visual Tree Inspection** — query the full MAUI visual tree via HTTP API or CLI
 - **Layout Diagnostics** — detect clipping, lost overflow, text truncation, overlap, and interaction occlusion with platform-specific evidence and confidence
 - **Element Interaction** — tap, fill, scroll, navigate, focus, resize, and mutate properties
+- **Application Menus** — inspect and invoke the app menu bar: the cross-platform MAUI `MenuBarItems` tree plus the native macOS AppKit `NSMenu` and active Mac Catalyst responder-chain key commands. Disabled items and disabled ancestors are respected; unhandled native actions report failure.
 - **Screenshots** — capture PNG screenshots from any platform (full window or per-element)
 - **Screen Recording** — start/stop video recording of app sessions
 - **Network Monitoring** — intercept and inspect HTTP requests/responses
@@ -234,13 +374,26 @@ For application code, prefer the typed `AgentClient` in
 `Microsoft.Maui.DevFlow.Driver`; use the protocol documents when implementing a
 client in another language or integrating directly with the agent.
 
+### Native Android controls outside the MAUI tree
+
+For a native-hosted popup that is absent from the MAUI logical tree, use
+`AndroidAppDriver.GetAccessibilityTreeAsync()` to inspect the current screen.
+Confirm the target package and control bounds before calling
+`TapCoordinateAsync(x, y)`. Coordinates are physical screen pixels from the
+Android accessibility bounds, not MAUI device-independent units.
+
+Set `Serial` when more than one device is connected. The coordinate tap rejects
+negative values and ambiguous device selection. Re-read the tree and capture
+the resulting screen after a tap; a completed input command is not proof that
+the intended action occurred.
+
 ## CLI Commands
 
 All DevFlow commands are available under `maui devflow`. Run `maui devflow <command> --help` for details.
 
 | Command Group | Description |
 |---------------|-------------|
-| `ui` | Visual tree, element interaction, screenshots, alerts, assertions |
+| `ui` | Visual tree, element interaction, screenshots, alerts, assertions, application menus |
 | `recording` | Start, stop, and manage screen recordings of app sessions |
 | `webview` | Blazor WebView automation — DOM, JS eval, navigation, input, screenshots |
 | `logs` | Fetch and stream application logs |
@@ -252,6 +405,38 @@ All DevFlow commands are available under `maui devflow`. Run `maui devflow <comm
 | `batch` | Execute command sequences from stdin |
 | `commands` | List all available commands (schema discovery) |
 | `mcp` | Start the MCP server for AI agent integration |
+
+### Application menus
+
+```bash
+maui devflow ui menu list --window 1
+maui devflow ui menu invoke --path "File/Save" --window 1
+maui devflow ui menu invoke --key s --modifiers cmd --target native
+```
+
+MAUI menus follow the visible page, including navigation, tabs, flyout detail and
+modal pages. Invocation defaults to the first matching MAUI item, then tries the
+native menu only if no MAUI item matched. A disabled item (or disabled ancestor)
+is a failure, not permission to run a different native command. Use `--window` to
+scope MAUI path/title/key matching; native menus use the active application
+responder chain.
+
+Copy paths from `menu list`: MAUI/AppKit title segments escape `%`, `/`, and
+backslash as `%25`, `%2F`, and `%5C`. Catalyst native paths are flat titles;
+fabricated hierarchical paths are not matched. Menu ids are positional and can
+change when menus change, so refresh the listing before invoking by id.
+MAUI items list all declared shortcuts in `accelerators`; `key` and `modifiers`
+retain the first shortcut. Menus on the deepest active page with definitions
+take precedence over its active ancestor containers. Menu invocation uses the
+same UI-mutation gate as other actions; containers and separators are not invokable.
+Prefer key plus modifiers for Catalyst. Invalid arguments return HTTP 400,
+missing items 404, disabled/unhandled actions 409, and unsupported backends 501.
+Native actions that stay inside a modal event loop return HTTP 202 with
+`status: "dispatched"` after five seconds. This acknowledges dispatch, not
+completion; inspect and dismiss the dialog before continuing.
+The client methods are `AgentClient.GetMenusAsync(window)` and
+`InvokeMenuAsync(..., window: window)` in the portable Client package (also
+available through Driver).
 
 ### Layout diagnostics
 
@@ -278,11 +463,112 @@ The same result is available through:
 - HTTP: `POST /api/v1/ui/diagnostics/layout`
 - Driver: `AgentClient.AnalyzeLayoutAsync`
 - MCP: `maui_layout_diagnostics`
-- Web Inspector: the Layout diagnostics side panel
+- Web Inspector: Data -> Layout (also opened by the toolbar's Layout button)
 
 Results distinguish violations, observations, incomplete checks, confidence,
 clip causes, visual versus interaction occlusion, and permanent platform
 limitations. Text content is not returned by default.
+
+Rule set **1.1** adds three managed-layout checks while retaining schema **1.0**:
+
+| Rule | Meaning | Result |
+| --- | --- | --- |
+| `layout.constraint-violation` | Conflicting minimum/maximum requests, or an arranged size outside those limits by at least one untransformed layout pixel at window density | Moderate violation for review |
+| `layout.desired-size-constrained` | The last measured desired size, with margins removed, exceeds the arranged size | Informational observation, not proof of lost content |
+| `layout.child-outside-parent` | A child's untransformed arranged frame extends outside its direct layout parent | Informational observation, not proof of clipping |
+
+Use `--minimum-severity info` to see the latter two rules. The Inspector's Layout
+dock starts with **All findings**; use **Filters** to select actionable findings,
+outcome, severity, confidence, or a rule. Selecting
+a child-outside-parent finding highlights the child and its layout parent with a
+distinct parent outline, not a clip outline. Lower-severity detections remain
+visible in `summary.filtered` even when their detailed findings are omitted.
+Existing clip, overflow and hit-test rules still establish whether content is
+actually lost or unreachable; the new observations do not turn intentional
+overlays into CI failures.
+
+The checks use already-captured MAUI measurements and never call `Measure` or
+change the app's layout. Native-only and Blazor nodes are not treated as
+successful managed checks. Scroll containers are excluded from desired-size
+checks, and direct scroll content, transformed elements, negative margins,
+unknown parents and cross-window relationships are excluded from parent-frame
+checks. Exclusions count as not applicable, not passes; platform coverage remains
+explicitly partial. A sizing/constraint change invalidates the diagnostics
+revision even when rendered bounds have not changed.
+
+Selected-subtree scans retain captured ancestor evidence for the selected root's
+parent-frame checks. Ancestors are analysis-only context: they are not counted,
+evaluated for findings or passes, or included in scoped overlap comparisons.
+Their sizing changes still invalidate stability and diagnostics revisions.
+
+A desired-size pass requires known measurements for both axes. A partly unknown
+measurement is not applicable rather than a whole-rule pass. Unstable snapshots
+skip these baseline checks and report global incompleteness once; they do not
+flood the findings list with one incomplete item per element.
+
+Sizing and `layoutOverflowInsetsPhysicalPixels` describe untransformed layout,
+while `fullRegion` and `parentRegion` are rendered highlight regions. An ancestor
+transform does not invalidate parent-local containment, but a finding records the
+coordinate-space limitation so its layout insets are not mistaken for painted
+edges. Existing desired-size-based content-overflow estimates use the same
+margin normalization, preventing contradictory findings on valid margin layouts.
+
+Clients should read `GET /api/v1/ui/diagnostics/layout/rules` before requesting
+these rule IDs from an older agent. Older agents retain their rule set and reject
+unknown explicit rule IDs; existing schema-1.0 requests are unchanged.
+
+The sample's **Layout Diagnostics** page has problem examples and a **Use valid
+layout** toggle for checking that these findings disappear after a correction.
+
+#### Layout workspace
+
+The original docked Layout experience is available with the current diagnostics
+contract: compact friendly finding rows, a detail view with measured sizing and
+limitations, and a coverage view listing every rule's actual support and
+confidence. Coverage does not invent per-element evaluated counts that the
+current agent does not report.
+Shared resources can appear under multiple parents in a MAUI tree. Ambiguous
+identities and their dependent subtrees are excluded with an explicit incomplete
+coverage limitation; they do not abort the scan or become guessed ownership.
+
+The first opening of **Layout** performs one scan. **Rescan** and **Recheck** are explicit;
+**Live** is opt-in and updates after observed layout changes while this dock is
+visible. Hiding or collapsing the dock stops scheduled live work. Screenshot
+polling no longer runs layout analysis on every refresh.
+Returning to a previously scanned Layout tab restores its report and Copilot
+attachment without another scan.
+The toolbar's Layout state follows the selected tab and dock visibility.
+Selecting Layout in a collapsed dock defers scanning until it is expanded;
+the toolbar button expands that workspace instead of closing the dock.
+Nested navigation pages and side-by-side flyout/detail panes remain available in
+the visual tree and finding overlays rather than being treated as inactive tabs.
+The default scan scope uses their common ancestor so a flyout sidebar cannot
+silently replace the main content as the inspection target.
+For Shell navigation, the agent marks its current page as selected even when
+the tab bar is hidden. Inspector and Canvas prefer that state over retained
+inactive-page geometry, keeping the screenshot, overlays, and scan target aligned.
+
+Changes mark the previous snapshot stale and remove its highlights. Navigation
+and reloads invalidate it even when the route and geometry are unchanged;
+repeated, unchanged connection snapshots do not count as navigation. A missing
+native event does not leave a visible workspace unchecked: lightweight frame
+polling compares the full tree revision, rendered state and the MAUI agent's
+lightweight diagnostic-input revision. Sizing requests and invalidated measurements
+mark the report stale even when geometry is unchanged, without running analysis
+during ordinary frame polling. Older or native-only agents without this optional
+signal retain geometry/rendered-state detection. This does not rescan diagnostics
+unless **Live** is enabled. A missing
+finding is not described as resolved when coverage is incomplete. Details offer
+**Show in app**, **Open source** when mapped, bounded **Copy payload** and **Add
+to Copilot** context, and confirmation before the existing project-policy
+suppression action. The confirmation shows the full policy path. Suppression
+requires a full project path from the host or an app built with
+`MauiDevFlowIncludeProjectPath=true`; a filename-only app identity never uses
+the broker's working directory for project policies. When the full project path
+is known, mapped source actions resolve project-relative XAML references to full
+local paths without requiring the file to be writable.
+Copilot context remains a redacted point-in-time snapshot,
+not mutation or source-write authority.
 
 Debug builds generate XAML source maps by default, so findings can include
 `sourceFile`, `sourceLine`, and `sourceColumn`. Source-content hashes are not
@@ -290,6 +576,9 @@ emitted by the diagnostics contract.
 Set `DevFlowXamlSourceMapsEnabled=false` to disable source embedding, or enable
 it explicitly for another configuration. Source maps embed developer file paths
 and XAML text and should normally remain disabled for Release/store builds.
+Source maps reuse MAUI's prepared XAML items regardless of target framework,
+including plain .NET GTK heads and macOS AppKit heads. Projects without the MAUI
+Controls build targets can still supply `MauiXaml` items for source mapping.
 
 The request privacy modes are:
 
@@ -368,7 +657,18 @@ dotnet build src/DevFlow/DevFlow.slnf
 
 # Run tests
 dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Tests/
+
+# GTK managed startup and dependency tests (no native GTK runtime required)
+dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Agent.Gtk.Tests/
 ```
+
+The GTK agent and Blazor bridge reference the in-repo Linux GTK4 projects. `DevFlow.slnf`
+includes those shipping dependencies and is used by both PR validation and the official
+DevFlow build. `publishDevFlowNuget` automatically enables the Linux GTK4 publication stage
+and waits for it to succeed before publishing DevFlow. The DevFlow preparation step also
+validates the GTK agents' in-repo dependency closure against the actual shipping nuspecs
+and rejects missing or mismatched package versions. `publishLinuxGtk4Nuget` remains available
+for Linux-only releases.
 
 ### Real app integration tests
 

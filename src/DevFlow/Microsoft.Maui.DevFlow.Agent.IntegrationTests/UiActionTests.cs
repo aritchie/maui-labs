@@ -452,6 +452,7 @@ public class UiActionTests : IntegrationTestBase
         return await FindElementAsync("RawTouchTarget");
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Pinch_OnRawTouchView_ArrivesAsTwoTouches()
     {
@@ -476,6 +477,7 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("scale=0.50", status.Text);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Pan_OnRawTouchView_DeliversTheWholeDrag()
     {
@@ -497,6 +499,7 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("dx=80", status.Text);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Pan_OnRawTouchViewInsideAScrollView_IsNotStolenByTheScrollView()
     {
@@ -526,6 +529,7 @@ public class UiActionTests : IntegrationTestBase
         return int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Swipe_OnRawTouchView_ArrivesAsADrag()
     {
@@ -547,6 +551,7 @@ public class UiActionTests : IntegrationTestBase
         Assert.True(ReadRawTouchDx(status.Text) > 0, status.Text);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Pan_OnRawTouchView_LongerThanTheView_IsShortenedToStayOnIt()
     {
@@ -570,6 +575,7 @@ public class UiActionTests : IntegrationTestBase
         Assert.InRange(ReadRawTouchDx(status.Text), 1, 4999);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Theory]
     [InlineData(0.0, 0.0)]
     [InlineData(1.0, 1.0)]
@@ -600,6 +606,7 @@ public class UiActionTests : IntegrationTestBase
         Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
         || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task Pan_OnAnOrdinaryButton_NeverDeliversSyntheticTouches()
     {

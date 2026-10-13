@@ -125,9 +125,8 @@ public class AgentMetadataTests : IntegrationTestBase
         var status = await Client.GetStatusAsync();
 
         Assert.NotNull(status?.Capabilities);
-        // The sample opts in everywhere, but the tier is UIKit-only: other platforms must
-        // report false rather than echo the option.
-        var expected = Platform is "ios" or "maccatalyst";
+        // Only the MAUI sample opts into the UIKit tier; native agents do not implement it.
+        var expected = !TestFramework.IsNative && Platform is "ios" or "maccatalyst";
         Assert.Equal(expected, status!.Capabilities!.SyntheticTouch);
     }
 }

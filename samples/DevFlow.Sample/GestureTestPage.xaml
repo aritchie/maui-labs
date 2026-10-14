@@ -163,16 +163,20 @@
                 </VerticalStackLayout>
             </Border>
 
-            <!-- Raw touch: no recognizer anywhere, the view takes touches itself by overriding
-                 the platform touch methods. Only real/synthetic touches reach this. -->
-            <Border StrokeShape="RoundRectangle 8" Padding="16">
+            <!-- Raw touch: the child takes touches directly; a native ancestor swipe must not preempt it. -->
+            <Border x:Name="NativeSwipeHost"
+                    StrokeShape="RoundRectangle 8"
+                    Padding="16"
+                    HandlerChanged="OnNativeSwipeHostHandlerChanged"
+                    HandlerChanging="OnNativeSwipeHostHandlerChanging">
                 <Border.BackgroundColor>
                     <AppThemeBinding Light="#DCE7C8" Dark="#3B4A2E" />
                 </Border.BackgroundColor>
                 <VerticalStackLayout Spacing="8">
                     <Label Text="Raw-touch target (GraphicsView)" FontAttributes="Bold" FontSize="16" />
                     <Label Text="Takes touches directly — no gesture recognizer to drive."
-                           FontSize="12" />
+                           FontSize="12"
+                           AutomationId="NativeSwipeProbeTarget" />
                     <GraphicsView x:Name="RawTouchCanvas"
                                   AutomationId="RawTouchTarget"
                                   HeightRequest="140"
@@ -183,6 +187,10 @@
                            Text="rawtouch: none"
                            FontSize="14"
                            AutomationId="RawTouchStatusLabel" />
+                    <Label x:Name="NativeSwipeStatusLabel"
+                           Text="native swipe: unavailable"
+                           FontSize="14"
+                           AutomationId="NativeSwipeStatusLabel" />
                 </VerticalStackLayout>
             </Border>
 

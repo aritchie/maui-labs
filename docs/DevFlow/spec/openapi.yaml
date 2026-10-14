@@ -1010,7 +1010,9 @@ paths:
         synthesised touches, which the agent only does when AgentOptions.EnableSyntheticTouch
         is set; /api/v1/agent/status reports whether that tier is available as
         capabilities.syntheticTouch. Controls, scroll views and views with gesture recognizers
-        never receive synthesised touches. The response reports which tier
+        never receive synthesised touches. On iOS and Mac Catalyst, native swipes prefer
+        target/descendant swipe recognizers and target-local pan/raw-touch handling before
+        falling back to ancestor swipe or pan recognizers. The response reports which tier
         serviced the gesture so callers can tell a real recognizer hit from a native fallback.
         Tap requires elementId; other gesture types target the current page when it is omitted.
       requestBody:

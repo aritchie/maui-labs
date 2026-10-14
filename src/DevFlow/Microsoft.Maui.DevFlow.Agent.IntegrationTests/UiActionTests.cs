@@ -553,6 +553,59 @@ public class UiActionTests : IntegrationTestBase
 
     [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
+    public async Task Swipe_OnRawTouchView_WithNativeAncestorSwipe_PrefersTheChild()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Native UIKit swipe recognizers are not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+        var before = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.StartsWith("native swipe: count=", before.Text);
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+        Assert.Contains("Synthetic UITouch", result.Detail);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.True(ReadRawTouchDx(status.Text) > 0, status.Text);
+        var after = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.Equal(before.Text, after.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Swipe_OnViewWithoutLocalHandling_FallsBackToNativeAncestorSwipe()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Native UIKit swipe recognizers are not available on {Platform}.");
+            return;
+        }
+
+        await FindRawTouchTargetAsync();
+        var target = await FindElementAsync("NativeSwipeProbeTarget");
+        var before = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.StartsWith("native swipe: count=", before.Text);
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+        Assert.Equal("UISwipeGestureRecognizer right", result.Detail);
+
+        await SettleAsync();
+        var after = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.NotEqual(before.Text, after.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
     public async Task Pan_OnRawTouchView_LongerThanTheView_IsShortenedToStayOnIt()
     {
         if (!SupportsRawTouchInjection)

@@ -31,6 +31,11 @@ public partial class GestureTestPage : ContentPage
     private int _guardPressed;
     private int _guardClicked;
 
+#if IOS || MACCATALYST
+    private UIKit.UISwipeGestureRecognizer? _nativeAncestorSwipe;
+    private int _nativeAncestorSwipeCount;
+#endif
+
     public GestureTestPage()
     {
         InitializeComponent();
@@ -39,6 +44,38 @@ public partial class GestureTestPage : ContentPage
 
         for (var i = 1; i <= 30; i++)
             NativeScrollContent.Add(new Label { Text = $"Native row {i}", AutomationId = $"NativeRow{i}" });
+    }
+
+    private void OnNativeSwipeHostHandlerChanged(object? sender, EventArgs e)
+    {
+#if IOS || MACCATALYST
+        if (NativeSwipeHost.Handler?.PlatformView is not UIKit.UIView view)
+            return;
+
+        _nativeAncestorSwipeCount = 0;
+        _nativeAncestorSwipe = new UIKit.UISwipeGestureRecognizer(() =>
+        {
+            NativeSwipeStatusLabel.Text = $"native swipe: count={++_nativeAncestorSwipeCount}";
+        })
+        {
+            Direction = UIKit.UISwipeGestureRecognizerDirection.Right
+        };
+        view.AddGestureRecognizer(_nativeAncestorSwipe);
+        NativeSwipeStatusLabel.Text = "native swipe: count=0";
+#endif
+    }
+
+    private void OnNativeSwipeHostHandlerChanging(object? sender, HandlerChangingEventArgs e)
+    {
+#if IOS || MACCATALYST
+        if (_nativeAncestorSwipe is { } recognizer)
+        {
+            recognizer.View?.RemoveGestureRecognizer(recognizer);
+            recognizer.Dispose();
+            _nativeAncestorSwipe = null;
+        }
+        NativeSwipeStatusLabel.Text = "native swipe: unavailable";
+#endif
     }
 
     private void OnPinchUpdated(object? sender, PinchGestureUpdatedEventArgs e)

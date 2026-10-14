@@ -476,13 +476,23 @@ public partial class PlatformAgentService
 
         var descendant = Descend(view, predicate);
         if (descendant != null) return descendant;
-        if (!includeAncestors) return null;
+        return includeAncestors ? FindAncestorRecognizer(view, predicate) : null;
+    }
 
+    private static T? FindAncestorRecognizer<T>(UIView view, Func<T, bool>? predicate = null)
+        where T : UIGestureRecognizer
+    {
         var ancestor = view.Superview;
         while (ancestor != null)
         {
-            var hit = OnView(ancestor, predicate);
-            if (hit != null) return hit;
+            if (ancestor.GestureRecognizers != null)
+            {
+                foreach (var recognizer in ancestor.GestureRecognizers)
+                {
+                    if (recognizer is T match && recognizer.Enabled && (predicate == null || predicate(match)))
+                        return match;
+                }
+            }
             ancestor = ancestor.Superview;
         }
         return null;
@@ -696,7 +706,8 @@ public partial class PlatformAgentService
     }
 
     private static async Task<string?> ApplePanAsync(
-        VisualElement element, double deltaX, double deltaY, int durationMs, int steps, AppleRawTouchPolicy? rawTouch)
+        VisualElement element, double deltaX, double deltaY, int durationMs, int steps,
+        AppleRawTouchPolicy? rawTouch, bool includeAncestors = true)
     {
         var view = GetAppleView(element);
         if (view == null) return null;
@@ -734,7 +745,7 @@ public partial class PlatformAgentService
 
         // 5. Only now an enclosing pan: a real finger would have been consumed by the element
         // above, so an ancestor's recognizer is the weakest reading of the request.
-        return FindRecognizer<UIPanGestureRecognizer>(view, IsDrivablePan) is { } ancestor
+        return includeAncestors && FindAncestorRecognizer<UIPanGestureRecognizer>(view, IsDrivablePan) is { } ancestor
             ? await DriveApplePanRecognizerAsync(ancestor, deltaX, deltaY, durationMs, steps)
             : null;
     }
@@ -790,17 +801,28 @@ public partial class PlatformAgentService
         };
 
         if (swipeDirection != default
-            && FindRecognizer<UISwipeGestureRecognizer>(view, r => r.Direction.HasFlag(swipeDirection)) is { } swipe
+            && FindRecognizer<UISwipeGestureRecognizer>(
+                view, r => r.Direction.HasFlag(swipeDirection), includeAncestors: false) is { } swipe
             && TrySetState(swipe, UIGestureRecognizerState.Ended))
             return $"UISwipeGestureRecognizer {direction}";
 
-        // Otherwise a swipe is a fast pan over the same surfaces.
+        // Try the child's fast-pan/raw-touch handling before any ancestor recognizer.
         var travel = distance > 0 ? distance : 120;
         var dx = direction switch { "left" => -travel, "right" => travel, _ => 0d };
         var dy = direction switch { "up" => -travel, "down" => travel, _ => 0d };
         var swipeDuration = durationMs > 0 ? Math.Min(durationMs, 150) : 100;
 
-        var detail = await ApplePanAsync(element, dx, dy, swipeDuration, 6, rawTouch);
+        var detail = await ApplePanAsync(element, dx, dy, swipeDuration, 6, rawTouch, includeAncestors: false);
+        if (detail != null) return $"{detail} (swipe {direction})";
+
+        if (swipeDirection != default
+            && FindAncestorRecognizer<UISwipeGestureRecognizer>(view, r => r.Direction.HasFlag(swipeDirection)) is { } ancestorSwipe
+            && TrySetState(ancestorSwipe, UIGestureRecognizerState.Ended))
+            return $"UISwipeGestureRecognizer {direction}";
+
+        detail = FindAncestorRecognizer<UIPanGestureRecognizer>(view, IsDrivablePan) is { } ancestorPan
+            ? await DriveApplePanRecognizerAsync(ancestorPan, dx, dy, swipeDuration, 6)
+            : null;
         return detail == null ? null : $"{detail} (swipe {direction})";
     }
 

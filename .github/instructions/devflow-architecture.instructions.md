@@ -192,6 +192,8 @@ Override virtual methods from `Agent.Abstractions/DevFlowAgentService.cs`:
      controls, scroll views, and recognizer-backed views are excluded. The status capability
      `syntheticTouch` reports whether the tier is enabled on that backend. `SKCanvasView` is not
      eligible because its touch handling is recognizer-backed.
+     Native swipes try target/descendant swipe recognizers, then target-local pan/raw-touch
+     handling, and only then ancestor swipe and pan recognizers.
    - **Windows** — `ScrollViewer.ChangeView`. Input injection needs the restricted
      `inputInjectionBrokered` capability and is unusable from a normal app package.
    - **macOS AppKit** — `NSScrollView` magnification and content offset.

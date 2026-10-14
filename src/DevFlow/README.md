@@ -5,6 +5,17 @@ the agent was split away from MAUI, for plain .NET Android, iOS, Mac Catalyst an
 
 > ⚠️ **Experimental** — APIs may change between releases. Not covered by the Microsoft Support Policy.
 
+## Integration CI
+
+`devflow-integration.yml` automatically tests DevFlow-relevant pull requests targeting
+`main`, including drafts. It covers MAUI and plain .NET apps on Android,
+iOS, Mac Catalyst and AppKit, plus MAUI Windows, GTK and WPF. Manual dispatch
+supports selecting a platform and framework.
+Use manual dispatch to run it on a branch that does not target `main`.
+
+Triggers cover DevFlow, its CLI, samples, platform backends and shared build inputs.
+The separate `ci-devflow.yml` workflow runs host, browser, JavaScript and AOT tests.
+
 ## Packages
 
 | Package | Description |
@@ -153,6 +164,9 @@ Use `Microsoft.Maui.DevFlow.Agent.Gtk` instead of the standard agent package wit
 `Microsoft.Maui.DevFlow.Blazor.Gtk` alongside `Microsoft.Maui.Platforms.Linux.Gtk4.BlazorWebView`.
 These packages use the in-repo GTK backend; remove superseded `Platform.Maui.Linux.Gtk4*`
 package references when migrating. Mixing the two backends is not supported.
+For Essentials diagnostics, reference `Microsoft.Maui.Platforms.Linux.Gtk4.Essentials`
+and call `builder.AddLinuxGtk4Essentials()`; a package reference alone does not initialize
+MAUI's static Preferences and FileSystem facades.
 
 ```csharp
 using Microsoft.Maui.DevFlow.Agent.Gtk;
@@ -194,9 +208,14 @@ without registering the agent reports an error instead of silently doing nothing
 Use `maui devflow list` to discover the assigned port rather than assuming port 9223.
 
 For Blazor Hybrid, register `builder.AddMauiBlazorDevFlowTools()` from
-`Microsoft.Maui.DevFlow.Blazor.Gtk` as well. CDP wiring and WebView discovery start on the
-same initialized window lifecycle, even if application startup takes more than two seconds.
-Later windows and explicit `WireBlazorCdpToAgent()` calls do not duplicate registrations.
+`Microsoft.Maui.DevFlow.Blazor.Gtk` as well. CDP wiring starts when the GTK window is
+created. WebViews are captured through their handlers, initialized on document load,
+and unregistered on detachment. Repeated `WireBlazorCdpToAgent()` calls are safe.
+
+Optional bridge diagnostics use `GtkBlazorWebViewDebugService.LogCallback`;
+`AddMauiBlazorDevFlowTools(enableLogging: true)` enables debugger output.
+JavaScript console entries are available through the DevFlow log API when log
+capture is enabled.
 
 ### 2b. Or, in a plain .NET app (no MAUI)
 
@@ -662,6 +681,16 @@ dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Tests/
 dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Agent.Gtk.Tests/
 ```
 
+Native GTK WebView tests require Linux, GTK 4.12+, WebKitGTK 6.0 and a display.
+Run them through the shared native test runner:
+
+```bash
+pwsh -File platforms/Linux.Gtk4/tests/run-native-tests.ps1 \
+  -TestProject src/DevFlow/Microsoft.Maui.DevFlow.Agent.Gtk.Tests/Microsoft.Maui.DevFlow.Agent.Gtk.Tests.csproj \
+  -TestNamespace Microsoft.Maui.DevFlow.Agent.Gtk.Tests \
+  -TestClass GtkWebViewSnapshotRuntimeTests
+```
+
 The GTK agent and Blazor bridge reference the in-repo Linux GTK4 projects. `DevFlow.slnf`
 includes those shipping dependencies and is used by both PR validation and the official
 DevFlow build. `publishDevFlowNuget` automatically enables the Linux GTK4 publication stage
@@ -672,7 +701,11 @@ for Linux-only releases.
 
 ### Real app integration tests
 
-The simulator/emulator-driven suite is kept separate from the fast PR test pass and is intended to be run explicitly. Set `DEVFLOW_TEST_PLATFORM` to one of: `maccatalyst` (or `mac`/`catalyst`), `ios`, `android`, `windows`. Defaults to `maccatalyst` on macOS, `windows` on Windows.
+The simulator/emulator-driven suite is separate from the fast host tests and runs
+automatically in integration CI as described above. For local runs, set
+`DEVFLOW_TEST_PLATFORM` to `maccatalyst` (or `mac`/`catalyst`), `ios`, `android`,
+`windows`, `macos`, `gtk`, or `wpf`. It defaults to `maccatalyst` on macOS and
+`windows` on Windows.
 
 ```bash
 # Mac Catalyst
@@ -689,6 +722,14 @@ DEVFLOW_TEST_PLATFORM=windows dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Age
 ```
 
 For local reliability, prefer running one platform suite at a time from a given repo worktree. Android fixture selection can be pinned with `DEVFLOW_TEST_ANDROID_AVD` and `DEVFLOW_TEST_ANDROID_SERIAL` when you want the harness to use a known emulator instance.
+
+CI sets `DEVFLOW_TEST_IOS_ISOLATED=true`: the fixture creates a fresh iPhone from
+the installed runtime's supported device types, then shuts down and deletes only
+that owned simulator, including after startup failure. `DEVFLOW_TEST_IOS_VERSION`
+selects the runtime. Set the isolation flag locally to avoid using an existing
+simulator; otherwise, the fixture prefers an available booted iPhone.
+The workflow pins the toolchain and runtime. Manual dispatch can select another
+installed runtime through `ios-runtime`.
 
 #### Running the suite against a plain .NET app
 
@@ -710,8 +751,8 @@ DEVFLOW_TEST_FRAMEWORK=native DEVFLOW_TEST_PLATFORM=maccatalyst \
   dotnet test src/DevFlow/Microsoft.Maui.DevFlow.Agent.IntegrationTests/ --filter "framework!=maui"
 ```
 
-`native` is supported for `android`, `ios` and `maccatalyst`. There is no plain-.NET Windows head,
-and the AppKit head under `samples/DevFlow.Sample.Native/MacOS` does not yet have a driving fixture.
+`native` is supported for `android`, `ios`, `maccatalyst`, and `macos`. There are no
+plain-.NET Windows, GTK, or WPF integration heads.
 
 There is also a manual GitHub Actions workflow at `.github/workflows/devflow-integration.yml` for running the same suite in CI.
 

@@ -33,10 +33,7 @@ public abstract class IntegrationTestBase
 
     protected async Task<JsonElement> GetJsonAsync(string path)
     {
-        using var response = await SendHttpWithTransportRetryAsync(() => Http.GetAsync(path));
-        response.EnsureSuccessStatusCode();
-        var body = await response.Content.ReadAsStringAsync();
-        return JsonSerializer.Deserialize<JsonElement>(body, JsonOptions);
+        return await SendHttpWithTransportRetryAsync(() => AppFixture.ReadCaptureAsync(Http, path));
     }
 
     protected Task<HttpResponseMessage> GetRawAsync(string path)
@@ -165,12 +162,12 @@ public abstract class IntegrationTestBase
         // Routes are Shell navigation, which only the MAUI sample has. The native samples are a
         // single screen carrying the same ids, so a route request degrades to "wait for the anchor".
         if (!TestFramework.IsNative)
-            await Client.NavigateAsync(route);
+        {
+            Assert.True(await Client.NavigateAsync(route), $"Navigation to '{route}' failed.");
+        }
 
         if (expectedAutomationId != null)
             await FindElementAsync(expectedAutomationId, timeoutMs);
-        else if (!TestFramework.IsNative)
-            await Task.Delay(500);
     }
 
     protected Task NavigateToMainPageAsync() => NavigateToPageAsync("//native", "AddButton");

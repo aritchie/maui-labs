@@ -35,6 +35,25 @@ maui devflow --agent-port <port> ui tap --automationId ShellSettingsButton
 The tree should include `ShellHomePage` beneath `ShellContent`, the title query
 should find a MAUI `Label`, and tapping the button should navigate to Settings.
 
+### Entry focus and native scrolling
+
+`Entry.Focus()` completes MAUI's focus request with the native WPF result, including
+password entries. Disabled entries reject focus, including after switching password
+mode. Native focus changes update `Entry.IsFocused` and its `Focused`/`Unfocused`
+events. DevFlow delta scrolling resolves the target's own
+ScrollViewer, then an internal descendant (such as CollectionView's list template),
+then an ancestor, on the UI dispatcher. CollectionView's vertical list uses
+device-independent pixel scroll offsets, not item counts, with `CanContentScroll`
+and `VirtualizingStackPanel` virtualization retained.
+
+Run the focused native regressions on Windows:
+
+```powershell
+dotnet test platforms\Windows.WPF\tests\HandlerTests\HandlerTests.csproj -p:UseMaui=false --filter FullyQualifiedName~WpfUiActionTests
+```
+
+Native focus tests require exclusive foreground access.
+
 ### Dynamic Shell items
 
 Changes to `Shell.Items`, `ShellItem.Items`, and `ShellSection.Items` on the UI

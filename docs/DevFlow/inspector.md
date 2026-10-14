@@ -67,6 +67,11 @@ Linux/GTK apps use `Microsoft.Maui.DevFlow.Agent.Gtk` and, for Blazor Hybrid,
 `Microsoft.Maui.DevFlow.Blazor.Gtk`. For plain .NET Android, iOS, Mac Catalyst, or macOS apps, see
 the [DevFlow quick start](../../src/DevFlow/README.md#2b-or-in-a-plain-net-app-no-maui).
 
+GTK Blazor CDP screenshots use WebKitGTK's native snapshot of the selected WebView.
+The WebView must be mapped with a nonzero viewport. `Page.captureScreenshot`
+supports visible-viewport PNG captures; clipping, full-document captures and other
+formats are unsupported. Detaching the bridge cancels pending capture.
+
 ### 3. Register DevFlow
 
 In `MauiProgram.cs`:

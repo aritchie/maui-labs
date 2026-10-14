@@ -41,6 +41,8 @@ namespace Microsoft.Maui.Handlers.WPF
 			{
 				_passwordBox.PasswordChanged -= OnPasswordChanged;
 				_passwordBox.KeyUp -= OnKeyUp;
+				_passwordBox.GotFocus -= OnFocusChanged;
+				_passwordBox.LostFocus -= OnFocusChanged;
 			}
 
 			base.DisconnectHandler(platformView);
@@ -76,6 +78,8 @@ namespace Microsoft.Maui.Handlers.WPF
 
 		void OnFocusChanged(object sender, RoutedEventArgs e)
 		{
+			if (VirtualView != null && sender is UIElement element)
+				VirtualView.IsFocused = element.IsFocused;
 			UpdatePlaceholderVisibility();
 		}
 
@@ -130,6 +134,23 @@ namespace Microsoft.Maui.Handlers.WPF
 			return new WBrush(WColor.FromArgb(
 				(byte)(color.Alpha * 255), (byte)(color.Red * 255),
 				(byte)(color.Green * 255), (byte)(color.Blue * 255)));
+		}
+
+		public static void MapFocus(EntryHandler handler, IEntry entry, object? args)
+		{
+			if (args is not FocusRequest request)
+				return;
+
+			UIElement? platformView = entry.IsPassword ? handler._passwordBox : handler.PlatformView;
+			var focused = entry.IsEnabled && platformView != null && platformView.Focus();
+			request.TrySetResult(focused);
+		}
+
+		public static void MapIsEnabled(EntryHandler handler, IEntry entry)
+		{
+			handler.PlatformView.IsEnabled = entry.IsEnabled;
+			if (handler._passwordBox != null)
+				handler._passwordBox.IsEnabled = entry.IsEnabled;
 		}
 
 		public static void MapText(EntryHandler handler, IEntry entry)
@@ -216,6 +237,8 @@ namespace Microsoft.Maui.Handlers.WPF
 					handler._passwordBox = new WPasswordBox();
 					handler._passwordBox.PasswordChanged += handler.OnPasswordChanged;
 					handler._passwordBox.KeyUp += handler.OnKeyUp;
+					handler._passwordBox.GotFocus += handler.OnFocusChanged;
+					handler._passwordBox.LostFocus += handler.OnFocusChanged;
 					MapFont(handler, entry);
 				}
 
@@ -236,6 +259,7 @@ namespace Microsoft.Maui.Handlers.WPF
 				if (handler._passwordBox != null)
 					handler._passwordBox.Visibility = System.Windows.Visibility.Collapsed;
 			}
+			MapIsEnabled(handler, entry);
 		}
 
 		public static void MapIsReadOnly(EntryHandler handler, IEntry entry)

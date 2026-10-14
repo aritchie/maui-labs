@@ -16,14 +16,14 @@ public class LayoutBaselineTests(AppFixture app, ITestOutputHelper output) : Int
         {
             await NavigateToPageAsync("//layoutdiagnostics", "BaselineFixtures");
             if ((await FindElementAsync("BaselineFixtureState")).Text != "Problem examples")
-                Assert.True(await Client.TapAsync((await FindElementAsync("ToggleBaselineFixtures")).Id));
+                await ToggleFixturesAsync("Problem examples");
 
             var root = await FindElementAsync("BaselineFixtures");
-            var toggle = await FindElementAsync("ToggleBaselineFixtures");
             var problems = await ScanAsync(root.Id);
             Assert.Equal("1.0", problems.SchemaVersion);
             Assert.Equal("1.1", problems.RuleSetVersion);
             Assert.True(problems.Snapshot.Stable, problems.Snapshot.StabilityReason);
+            await AssertOverflowGeometryAsync(180);
             Assert.Contains(problems.Findings, finding => finding.RuleId == LayoutDiagnosticRules.ConstraintViolation
                 && finding.Element.AutomationId == "ConflictingLimitsBox" && finding.Outcome == "violation");
             Assert.Contains(problems.Findings, finding => finding.RuleId == LayoutDiagnosticRules.DesiredSizeConstrained
@@ -49,10 +49,11 @@ public class LayoutBaselineTests(AppFixture app, ITestOutputHelper output) : Int
                     or LayoutDiagnosticRules.DesiredSizeConstrained
                     or LayoutDiagnosticRules.ChildOutsideParent);
 
-            Assert.True(await Client.TapAsync(toggle.Id));
+            await ToggleFixturesAsync("Valid layout");
             var corrected = await ScanAsync(root.Id);
 
             Assert.True(corrected.Snapshot.Stable, corrected.Snapshot.StabilityReason);
+            await AssertOverflowGeometryAsync(80);
             Assert.DoesNotContain(corrected.Findings, finding => finding.Element.AutomationId is
                 "ConflictingLimitsBox" or "ConstrainedDesiredProbe" or "BaselineOverflowChild"
                 or "BaselineValidMargin" or "BaselineScrollableContent" or "BaselineValidScroll");
@@ -67,11 +68,34 @@ public class LayoutBaselineTests(AppFixture app, ITestOutputHelper output) : Int
             if ((await Client.GetStatusAsync())?.Route == "//layoutdiagnostics"
                 && (await TryFindElementAsync("BaselineFixtureState"))?.Text == "Valid layout")
             {
-                await Client.TapAsync((await FindElementAsync("ToggleBaselineFixtures")).Id);
+                await ToggleFixturesAsync("Problem examples");
             }
             await Client.NavigateAsync(originalRoute);
             await Client.ControlMutationLeaseAsync("release");
         }
+    }
+
+    private async Task AssertOverflowGeometryAsync(double childWidth)
+    {
+        foreach (var (automationId, expectedWidth) in new[]
+        {
+            ("BaselineOverflowParent", 120d),
+            ("BaselineOverflowChild", childWidth)
+        })
+        {
+            var element = await FindElementAsync(automationId);
+            var bounds = element.WindowBounds ?? element.Bounds;
+            Assert.NotNull(bounds);
+            Assert.Equal(expectedWidth, bounds!.Width, precision: 1);
+        }
+    }
+
+    private async Task ToggleFixturesAsync(string expectedState)
+    {
+        var toggle = await FindElementAsync("ToggleBaselineFixtures");
+        Assert.True(await Client.ScrollAsync(toggle.Id, animated: false));
+        Assert.True(await Client.TapAsync(toggle.Id));
+        Assert.Equal(expectedState, (await FindElementAsync("BaselineFixtureState")).Text);
     }
 
     private async Task<LayoutInspectionResult> ScanAsync(

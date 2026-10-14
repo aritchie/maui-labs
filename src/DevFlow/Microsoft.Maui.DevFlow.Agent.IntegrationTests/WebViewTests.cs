@@ -362,8 +362,7 @@ public class WebViewTests : IntegrationTestBase
 
         Assert.True(response.IsSuccessStatusCode,
             $"WebView navigate failed with status {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
-        // Wait for chobitsu to re-inject after the nav before we navigate back.
-        await App.WaitForCdpResponsiveAsync(15000);
+        await AssertWebViewPathAsync(contextId, "/counter");
         contextId = await GetActiveContextIdAsync();
 
         var backResponse = await PostWithBridgeRetryAsync("/api/v1/webview/navigate", new
@@ -373,8 +372,22 @@ public class WebViewTests : IntegrationTestBase
         });
         Assert.True(backResponse.IsSuccessStatusCode,
             $"WebView navigate back failed with status {(int)backResponse.StatusCode}: {await backResponse.Content.ReadAsStringAsync()}");
-        await App.WaitForCdpResponsiveAsync(15000);
+        await AssertWebViewPathAsync(contextId, "/");
         App.InvalidateBlazorReady();
+    }
+
+    async Task AssertWebViewPathAsync(string contextId, string expectedPath)
+    {
+        var result = await Client.SendCdpCommandAsync(
+            "Runtime.evaluate",
+            new JsonObject
+            {
+                ["expression"] = "location.pathname",
+                ["returnByValue"] = true
+            },
+            contextId);
+        Assert.Equal(expectedPath,
+            result.GetProperty("result").GetProperty("result").GetProperty("value").GetString());
     }
 
     [Fact]

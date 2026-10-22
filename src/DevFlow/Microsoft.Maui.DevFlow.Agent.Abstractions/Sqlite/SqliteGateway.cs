@@ -28,10 +28,9 @@ internal static class SqliteGateway
     /// out - it is a warm device with a flat battery, holding a write lock on a file the file
     /// manager is also showing.
     /// </remarks>
-    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20);
 
     private static readonly object ProviderGate = new();
-    private static volatile bool _providerReady;
 
     /// <summary>
     /// Makes sure a SQLite provider is registered, without ever replacing one that is.
@@ -45,60 +44,43 @@ internal static class SqliteGateway
     /// opened with.
     /// </para>
     /// <para>
-    /// When nothing is registered yet there is nothing to replace, so the app's own batteries bundle is
-    /// initialised if it ships one - the same thing the app's first connection would do. With no
-    /// bundle at all the app has no SQLite to browse, and that is the error.
+    /// With no registered provider, only an explicit host initialization callback may register one.
     /// </para>
     /// </remarks>
     /// <exception cref="InvalidOperationException">The app has no SQLite provider.</exception>
-    public static void EnsureProvider()
+    public static void EnsureProvider(SqliteBrowserOptions? options = null)
     {
-        if (_providerReady)
-            return;
-
         lock (ProviderGate)
         {
-            if (_providerReady)
-                return;
-
-            if (!HasProvider())
+            var registered = false;
+            try { _ = raw.sqlite3_libversion_number(); registered = true; }
+            catch (Exception ex) when (ex.Message.Contains("SetProvider", StringComparison.Ordinal))
             {
-                RegisterAppBundle();
-
-                // Not remembered: an app that registers its provider later should not be told no forever.
-                if (!HasProvider())
-                    throw new InvalidOperationException("This app has no SQLite provider registered, so there is no SQLite to open its databases with.");
+                // Only the SQLitePCLRaw "no provider" error allows host initialization.
             }
-
-            _providerReady = true;
+            if (!registered)
+                options?.InitializeProvider?.Invoke();
+            if (!IsAvailable(out var reason))
+                throw new InvalidOperationException(reason);
         }
     }
 
-    private static bool HasProvider()
+    public static bool IsAvailable(out string? reason)
     {
         try
         {
-            // Any call into the provider throws when none is registered.
-            _ = raw.sqlite3_libversion_number();
+            if (raw.sqlite3_libversion_number() < 3035000)
+            {
+                reason = "SQLite 3.35 or later is required for the database browser.";
+                return false;
+            }
+            reason = null;
             return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            reason = $"No usable SQLite provider is registered. Initialize the app's provider before browsing databases. {ex.Message}";
             return false;
-        }
-    }
-
-    private static void RegisterAppBundle()
-    {
-        try
-        {
-            Type.GetType("SQLitePCL.Batteries_V2, SQLitePCLRaw.batteries_v2")
-                ?.GetMethod("Init", Type.EmptyTypes)
-                ?.Invoke(null, null);
-        }
-        catch (Exception)
-        {
-            // A bundle that will not load leaves no provider, which the caller reports.
         }
     }
 
@@ -110,17 +92,21 @@ internal static class SqliteGateway
     /// The file is not a SQLite database - a perfectly ordinary thing for a file called <c>.db</c>
     /// to turn out not to be - or SQLite refused to open it.
     /// </exception>
-    public static SqliteDatabase Open(string fullPath, TimeSpan? timeout = null)
+    public static SqliteDatabase Open(string fullPath, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null, bool readOnly = false)
     {
-        EnsureProvider();
+        EnsureProvider(options);
 
         // ReadWrite and not create: a typo in a path should be an error, not a new empty database
         // appearing in the directory the file manager is showing. And one connection per request,
         // closed with the request, so no pooled handle keeps a lock the file manager then trips over.
-        var database = SqliteDatabase.Open(fullPath, raw.SQLITE_OPEN_READWRITE, timeout ?? DefaultTimeout);
+        var database = SqliteDatabase.Open(fullPath,
+            readOnly ? raw.SQLITE_OPEN_READONLY : raw.SQLITE_OPEN_READWRITE,
+            timeout ?? options?.Timeout ?? DefaultTimeout, cancellationToken);
 
         try
         {
+            options?.ConfigureConnection?.Invoke(new SqliteConnectionContext(database, fullPath, readOnly, false));
             Restrict(database.Handle);
 
             // Open does not touch the file. SQLite reads page one when the first statement is
@@ -129,6 +115,8 @@ internal static class SqliteGateway
             // SQLite's own wording instead of a sentence about the file being the wrong sort of
             // thing. This is the cheapest statement that forces the header to be read.
             database.Execute("PRAGMA schema_version");
+            if (!readOnly)
+                database.Execute("PRAGMA foreign_keys = ON");
         }
         catch (SqliteError ex)
         {
@@ -197,15 +185,31 @@ internal static class SqliteGateway
     /// Writes the header of a new, empty database - a real one, that anything it is later handed to
     /// will open as a database.
     /// </summary>
-    public static void Create(string fullPath)
+    public static void Create(string fullPath, CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null,
+        TimeSpan? timeout = null)
     {
-        EnsureProvider();
+        EnsureProvider(options);
 
-        using var database = SqliteDatabase.Open(
-            fullPath, raw.SQLITE_OPEN_READWRITE | raw.SQLITE_OPEN_CREATE, DefaultTimeout);
-
-        // Opening alone leaves a zero-byte file: SQLite writes page one when it first has something
-        // to put in it. A pragma that changes a setting is the cheapest thing that counts as that.
-        database.Execute("PRAGMA user_version = 0");
+        var temporary = Path.Combine(Path.GetDirectoryName(fullPath)!, $".devflow-database-{Guid.NewGuid():N}");
+        try
+        {
+            using (File.Open(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+            }
+            using (var database = SqliteDatabase.Open(temporary, raw.SQLITE_OPEN_READWRITE,
+                timeout ?? options?.Timeout ?? DefaultTimeout, cancellationToken))
+            {
+                options?.ConfigureConnection?.Invoke(new SqliteConnectionContext(database, fullPath, false, true));
+                Restrict(database.Handle);
+                database.Execute("PRAGMA user_version = 0");
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporary, fullPath, overwrite: false);
+        }
+        finally
+        {
+            foreach (var suffix in new[] { "", "-wal", "-shm", "-journal" })
+                File.Delete(temporary + suffix);
+        }
     }
 }

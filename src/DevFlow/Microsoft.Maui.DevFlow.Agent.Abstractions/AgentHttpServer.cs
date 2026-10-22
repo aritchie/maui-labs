@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -20,7 +21,7 @@ public class AgentHttpServer : IDisposable
     /// app under test down with it. Raised from 1MB when the storage routes gained real uploads -
     /// a database or a screenshot is routinely larger than that.
     /// </summary>
-    private const int MaxRequestBodyBytes = 64 * 1024 * 1024;
+    internal const int MaxRequestBodyBytes = 64 * 1024 * 1024;
 
     /// <summary>Header block ceiling. A request still short of its blank line past this is not one we want.</summary>
     private const int MaxHeaderBytes = 64 * 1024;
@@ -149,6 +150,7 @@ public class AgentHttpServer : IDisposable
                 client.Dispose();
                 return;
             }
+            using var requestOwner = request;
 
             request.Headers.TryGetValue("Origin", out var origin);
             if (!IsTrustedBrowserOrigin(origin))
@@ -219,6 +221,7 @@ public class AgentHttpServer : IDisposable
                         response = HttpResponse.Error(ex.Message, 500, AgentJson.IsMissingMetadata(ex)
                             ? "json-metadata-missing" : "json-serialization-unsupported");
                     }
+                    using var responseOwner = response;
                     if (!requestCts.IsCancellationRequested)
                     {
                         await WriteResponseAsync(
@@ -287,6 +290,7 @@ public class AgentHttpServer : IDisposable
     /// </summary>
     private async Task<HttpRequest?> ReadRequestAsync(NetworkStream stream, CancellationToken ct)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
 
@@ -307,7 +311,7 @@ public class AgentHttpServer : IDisposable
                 pending.Write(buffer, 0, read);
                 headerEnd = IndexOfHeaderEnd(pending.GetBuffer(), (int)pending.Length);
 
-                if (headerEnd < 0 && pending.Length > MaxHeaderBytes)
+                if (headerEnd > MaxHeaderBytes || headerEnd < 0 && pending.Length > MaxHeaderBytes)
                     return null;
             }
         }
@@ -356,9 +360,12 @@ public class AgentHttpServer : IDisposable
         // Body: whatever came in behind the headers, plus the rest of it. Counted and kept in bytes
         // rather than characters - Content-Length counts bytes, and a multi-byte or binary payload
         // makes the two differ.
-        byte[]? bodyBytes = null;
         var bodyStart = headerEnd + 4;
         var haveBodyBytes = Math.Max(0, rawLength - bodyStart);
+        headers.TryGetValue("Content-Type", out var mediaType);
+        var rawUpload = method == "PUT" && path.StartsWith("/api/v1/storage/files/", StringComparison.Ordinal)
+            && !string.IsNullOrEmpty(mediaType) && !mediaType.Contains("json", StringComparison.OrdinalIgnoreCase);
+        using var body = new RequestBodyBuffer(rawUpload);
 
         // Chunked comes first: a chunked request also has no Content-Length, and .NET's own
         // JsonContent sends this way, so treating the chunk framing as the body loses every such
@@ -366,8 +373,7 @@ public class AgentHttpServer : IDisposable
         if (headers.TryGetValue("Transfer-Encoding", out var transferEncoding)
             && transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
         {
-            bodyBytes = await ReadChunkedBodyAsync(stream, raw, bodyStart, haveBodyBytes, ct).ConfigureAwait(false);
-            if (bodyBytes == null)
+            if (!await ReadChunkedBodyAsync(stream, raw, bodyStart, haveBodyBytes, body.Stream, ct).ConfigureAwait(false))
                 return null;
         }
         else if (headers.TryGetValue("Content-Length", out var contentLengthText))
@@ -380,31 +386,28 @@ public class AgentHttpServer : IDisposable
 
             if (contentLength > 0)
             {
-                bodyBytes = new byte[contentLength];
                 var copied = Math.Min(haveBodyBytes, contentLength);
-                Buffer.BlockCopy(raw, bodyStart, bodyBytes, 0, copied);
+                await body.Stream.WriteAsync(raw.AsMemory(bodyStart, copied), ct).ConfigureAwait(false);
 
                 try
                 {
                     while (copied < contentLength)
                     {
                         var read = await ReadWithIdleTimeoutAsync(
-                            stream, bodyBytes.AsMemory(copied, contentLength - copied), ct).ConfigureAwait(false);
+                            stream, buffer.AsMemory(0, Math.Min(buffer.Length, contentLength - copied)), ct).ConfigureAwait(false);
 
-                        if (read == 0) break;
+                        if (read == 0) return null;
+                        await body.Stream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                         copied += read;
                     }
                 }
                 catch { return null; }
 
-                if (copied < contentLength)
-                    Array.Resize(ref bodyBytes, copied);
             }
         }
         else if (haveBodyBytes > 0)
         {
-            bodyBytes = new byte[haveBodyBytes];
-            Buffer.BlockCopy(raw, bodyStart, bodyBytes, 0, haveBodyBytes);
+            return null; // HTTP/1.1 request bodies need explicit framing.
         }
 
         return new HttpRequest
@@ -413,7 +416,9 @@ public class AgentHttpServer : IDisposable
             Path = path.TrimEnd('/'),
             QueryParams = queryParams,
             Headers = headers,
-            BodyBytes = bodyBytes
+            StartedAt = startedAt,
+            BodyBytes = rawUpload ? null : body.ToArray(),
+            BodyStream = rawUpload ? body.Detach() : null
         };
     }
 
@@ -423,13 +428,12 @@ public class AgentHttpServer : IDisposable
     /// </summary>
     /// <returns>The body, or null if the framing was malformed or the stream ended early.</returns>
     /// <exception cref="RequestBodyTooLargeException">The chunks added up past the ceiling.</exception>
-    private static async Task<byte[]?> ReadChunkedBodyAsync(
-        NetworkStream stream, byte[] initial, int offset, int count, CancellationToken ct)
+    private static async Task<bool> ReadChunkedBodyAsync(
+        NetworkStream stream, byte[] initial, int offset, int count, Stream body, CancellationToken ct)
     {
         var pending = new MemoryStream();
         pending.Write(initial, offset, count);
 
-        var body = new MemoryStream();
         var pos = 0;
 
         // Size lines and CRLFs, counted separately from the body. The body ceiling says nothing about
@@ -445,19 +449,19 @@ public class AgentHttpServer : IDisposable
                 // Everything unread is part of the one line, so past the longest a line may be there
                 // is nothing more to wait for.
                 if (pending.Length - pos > MaxChunkLineBytes)
-                    return null;
+                    return false;
 
                 Discard(pending, ref pos);
                 if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
-                    return null;
+                    return false;
             }
 
             if (lineEnd - pos > MaxChunkLineBytes)
-                return null;
+                return false;
 
             framing += lineEnd - pos + 2;
             if (framing > MaxChunkFramingBytes)
-                return null;
+                return false;
 
             var sizeText = Encoding.ASCII.GetString(pending.GetBuffer(), pos, lineEnd - pos);
             var extension = sizeText.IndexOf(';');
@@ -465,7 +469,7 @@ public class AgentHttpServer : IDisposable
                 sizeText = sizeText[..extension];
 
             if (!int.TryParse(sizeText.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var chunkSize) || chunkSize < 0)
-                return null;
+                return false;
 
             pos = lineEnd + 2;
             if (chunkSize == 0)
@@ -480,7 +484,7 @@ public class AgentHttpServer : IDisposable
             while (true)
             {
                 var available = (int)Math.Min(pending.Length - pos, remaining);
-                body.Write(pending.GetBuffer(), pos, available);
+                await body.WriteAsync(pending.GetBuffer().AsMemory(pos, available), ct).ConfigureAwait(false);
                 pos += available;
                 remaining -= available;
 
@@ -489,29 +493,69 @@ public class AgentHttpServer : IDisposable
 
                 Discard(pending, ref pos);
                 if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
-                    return null;
+                    return false;
             }
 
             while (pending.Length - pos < 2)
             {
                 Discard(pending, ref pos);
                 if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
-                    return null;
+                    return false;
             }
 
             // Every chunk ends with CRLF. Skipping two bytes without checking would quietly accept
             // malformed framing and put the following bytes out of step with the length lines.
             var terminator = pending.GetBuffer();
             if (terminator[pos] != (byte)'\r' || terminator[pos + 1] != (byte)'\n')
-                return null;
+                return false;
 
             pos += 2;
             framing += 2;
             if (framing > MaxChunkFramingBytes)
-                return null;
+                return false;
         }
 
-        return body.ToArray();
+        while (true)
+        {
+            int lineEnd;
+            while ((lineEnd = IndexOfCrLf(pending.GetBuffer(), pos, (int)pending.Length)) < 0)
+            {
+                if (pending.Length - pos > MaxChunkLineBytes)
+                    return false;
+                Discard(pending, ref pos);
+                if (!await FillAsync(stream, pending, ct).ConfigureAwait(false))
+                    return false;
+            }
+            framing += lineEnd - pos + 2;
+            if (lineEnd - pos > MaxChunkLineBytes || framing > MaxChunkFramingBytes)
+                return false;
+            if (lineEnd == pos)
+                return true;
+            pos = lineEnd + 2;
+        }
+    }
+
+    private sealed class RequestBodyBuffer : IDisposable
+    {
+        private Stream? _stream;
+
+        public RequestBodyBuffer(bool fileBacked)
+            => _stream = fileBacked
+                ? new FileStream(Path.Combine(Path.GetTempPath(), $"devflow-upload-{Guid.NewGuid():N}"),
+                    FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 64 * 1024,
+                    FileOptions.Asynchronous | FileOptions.DeleteOnClose)
+                : new MemoryStream();
+
+        public Stream Stream => _stream!;
+        public byte[]? ToArray() => Stream.Length == 0 ? null : ((MemoryStream)Stream).ToArray();
+        public Stream Detach()
+        {
+            var stream = Stream;
+            stream.Position = 0;
+            _stream = null;
+            return stream;
+        }
+        public void Dispose() => _stream?.Dispose();
     }
 
     /// <summary>
@@ -724,7 +768,8 @@ public class AgentHttpServer : IDisposable
         var headerBuilder = new StringBuilder();
         headerBuilder.Append($"HTTP/1.1 {response.StatusCode} {response.StatusText}\r\n");
         headerBuilder.Append($"Content-Type: {response.ContentType}\r\n");
-        headerBuilder.Append($"Content-Length: {(response.BodyBytes ?? bodyBytes).Length}\r\n");
+        var length = response.BodyStream is { } source ? source.Length - source.Position : (response.BodyBytes ?? bodyBytes).LongLength;
+        headerBuilder.Append($"Content-Length: {length}\r\n");
         if (!string.IsNullOrWhiteSpace(origin))
         {
             headerBuilder.Append($"Access-Control-Allow-Origin: {origin}\r\n");
@@ -745,7 +790,20 @@ public class AgentHttpServer : IDisposable
 
         var headerBytes = Encoding.UTF8.GetBytes(headerBuilder.ToString());
         await stream.WriteAsync(headerBytes, ct).ConfigureAwait(false);
-        await stream.WriteAsync(response.BodyBytes ?? bodyBytes, ct).ConfigureAwait(false);
+        if (response.BodyStream is { } content)
+        {
+            var buffer = new byte[64 * 1024];
+            while (length > 0)
+            {
+                var read = await content.ReadAsync(buffer.AsMemory(0, (int)Math.Min(length, buffer.Length)), ct).ConfigureAwait(false);
+                if (read == 0)
+                    throw new IOException("The file changed while it was being downloaded.");
+                await stream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                length -= read;
+            }
+        }
+        else
+            await stream.WriteAsync(response.BodyBytes ?? bodyBytes, ct).ConfigureAwait(false);
         await stream.FlushAsync(ct).ConfigureAwait(false);
     }
 
@@ -913,8 +971,13 @@ public class AgentHttpServer : IDisposable
     }
 }
 
-public class HttpRequest
+public class HttpRequest : IDisposable
 {
+    internal long StartedAt { get; init; } = Stopwatch.GetTimestamp();
+    /// <summary>Completed, seekable raw upload body. Owned and disposed by the server.</summary>
+    [JsonIgnore]
+    public Stream? BodyStream { get; internal set; }
+    public void Dispose() => BodyStream?.Dispose();
     public string Method { get; set; } = "GET";
     public string Path { get; set; } = "/";
     public Dictionary<string, string> QueryParams { get; set; } = new();
@@ -1004,8 +1067,12 @@ public class HttpRequest
         => Body != null ? JsonSerializer.Deserialize(Body, typeInfo) : null;
 }
 
-public class HttpResponse
+public class HttpResponse : IDisposable
 {
+    /// <summary>Optional seekable response body. Owned and disposed by the server.</summary>
+    [JsonIgnore]
+    public Stream? BodyStream { get; set; }
+    public void Dispose() => BodyStream?.Dispose();
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions ErrorJsonOptions = new()
     {
@@ -1079,7 +1146,7 @@ public class HttpResponse
     {
         Body = JsonSerializer.Serialize(
             new SuccessResponse { Success = true, Message = message },
-            AgentJsonContext.Default.SuccessResponse)
+            StorageAgentJsonContext.Default.SuccessResponse)
     };
 
     public static HttpResponse Error(string message, int statusCode = 400, string? reason = null, object? details = null)
@@ -1090,7 +1157,7 @@ public class HttpResponse
         var body = details == null
             ? JsonSerializer.Serialize(
                 new ErrorResponse { Success = false, Error = message, Reason = NullIfBlank(reason) },
-                AgentJsonContext.Default.ErrorResponse)
+                StorageAgentJsonContext.Default.ErrorResponse)
             : SerializeErrorWithDetails(message, reason, details);
 
         return new HttpResponse

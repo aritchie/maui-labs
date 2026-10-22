@@ -389,8 +389,11 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
             ["get", "set", "delete", "clear"], reason);
         capabilities["storage.files"] = Capability(1, true,
             ["roots", "list", "download", "upload", "delete", "create-directory", "delete-directory", "move", "raw-transfer"], null);
-        capabilities["storage.sqlite"] = Capability(1, true,
-            ["schema", "query", "rows", "insert-row", "update-row", "delete-row", "create"], null);
+        var sqliteAvailable = Sqlite.SqliteGateway.IsAvailable(out var sqliteReason);
+        capabilities["storage.sqlite"] = Capability(1, sqliteAvailable || _options.Sqlite.InitializeProvider is not null,
+            ["schema", "query", "rows", "insert-row", "update-row", "delete-row", "create",
+             "typed-cells", "string-rowids", "pagination", "optimistic-concurrency"],
+            sqliteAvailable ? null : sqliteReason);
         capabilities["invoke"] = Capability(1, true, ["actions"], null);
         var themeCapability = Capability(1, IsThemeSupported, ["get", "set"], reason);
         capabilities["theme"] = themeCapability;

@@ -63,7 +63,7 @@ public class SqliteBrowserTests
         var result = await fixture.Client.GetDatabaseRowsAsync("app.db", "people");
 
         Assert.Equal(["id", "name", "email", "avatar"], result.GetProperty("columns").EnumerateArray().Select(x => x.GetString()));
-        Assert.Equal([1L, 2L], result.GetProperty("rowIds").EnumerateArray().Select(x => x.GetInt64()));
+        Assert.Equal(["1", "2"], result.GetProperty("rowIds").EnumerateArray().Select(x => x.GetString()));
 
         var ada = result.GetProperty("rows")[0];
         Assert.Equal("Ada", ada[1].GetString());
@@ -269,6 +269,26 @@ public class SqliteBrowserTests
     }
 
     [Fact]
+    public async Task Create_FailedHostConfigurationLeavesNoPartialDatabase()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var target = Path.Combine(fixture.Root, "failed.db");
+        var options = new SqliteBrowserOptions
+        {
+            ConfigureConnection = connection =>
+            {
+                Assert.True(connection.IsNew);
+                Assert.Equal(target, connection.Path);
+                throw new InvalidOperationException("Host configuration failed.");
+            }
+        };
+        Assert.Throws<InvalidOperationException>(() => SqliteGateway.Create(target, options: options));
+        Assert.False(File.Exists(target));
+        Assert.DoesNotContain(Directory.GetFiles(fixture.Root),
+            p => Path.GetFileName(p).StartsWith(".devflow-database-", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Rows_AreFoundWhateverCaseTheTableIsAskedForIn()
     {
         await using var fixture = await Fixture.CreateAsync();
@@ -329,7 +349,7 @@ public class SqliteBrowserTests
 
         var rows = await fixture.Client.GetDatabaseRowsAsync("app.db", "tags");
         Assert.Equal(["rowid", "label"], rows.GetProperty("columns").EnumerateArray().Select(x => x.GetString()));
-        Assert.Equal([1L, 2L], rows.GetProperty("rowIds").EnumerateArray().Select(x => x.GetInt64()));
+        Assert.Equal(["1", "2"], rows.GetProperty("rowIds").EnumerateArray().Select(x => x.GetString()));
 
         var updated = await fixture.Client.UpdateDatabaseRowAsync("app.db", "tags", 1, [("label", "changed")]);
         Assert.Null(GetError(updated));
@@ -454,6 +474,229 @@ public class SqliteBrowserTests
         Assert.DoesNotContain(packages, x => x.StartsWith("SQLitePCLRaw.bundle", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task GeneratedRowidColumn_DoesNotShadowTheIdentityUsedForEdits()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            "CREATE TABLE generated (label TEXT, rowid INTEGER GENERATED ALWAYS AS (1) VIRTUAL);"
+            + "INSERT INTO generated(label) VALUES ('first'), ('second')");
+        var rows = await fixture.Client.ReadDatabaseRowsAsync("app.db", "generated");
+        Assert.Equal(["1", "2"], rows.RowIds);
+        var result = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "generated", rows.RowIds[0],
+            [new() { Column = "label", Type = "text", Value = "changed" }], rows.RowVersions[0]);
+        Assert.Null(result.Error);
+        Assert.Equal(1, result.RowsAffected);
+        var remaining = await fixture.Client.ReadDatabaseRowsAsync("app.db", "generated");
+        Assert.Equal(["changed", "second"], remaining.Rows.Select(r => r[0]));
+
+        var schema = await fixture.Client.ReadDatabaseSchemaAsync("app.db");
+        var column = schema.Tables.Single(t => t.Name == "generated").Columns.Single(c => c.Name == "rowid");
+        Assert.True(column.IsGenerated);
+        Assert.False(column.IsWritable);
+        var refused = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "generated", "1",
+            [new() { Column = "rowid", Value = "8" }]);
+        Assert.Contains("generated or hidden", refused.Error);
+    }
+
+    [Fact]
+    public async Task ColumnMatching_FoldsAsciiButNotDistinctUnicodeNames()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            "CREATE TABLE unicode (\"é\" TEXT, \"É\" TEXT); INSERT INTO unicode VALUES ('lower', 'upper')");
+        var changed = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "unicode", "1",
+            [new() { Column = "É", Value = "edited" }]);
+        Assert.Null(changed.Error);
+        Assert.Equal(new string?[] { "lower", "edited" }, changed.Rows[0].AsEnumerable());
+    }
+
+    [Fact]
+    public async Task RowIds_RoundTripAll64BitsAsStrings()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db",
+            "INSERT INTO notes(rowid, body) VALUES (9007199254740992, 'one'), (9007199254740993, 'two'), (9223372036854775807, 'last')");
+        var rows = await fixture.Client.ReadDatabaseRowsAsync("app.db", "notes");
+        Assert.Equal(["9007199254740992", "9007199254740993", "9223372036854775807"], rows.RowIds);
+        var changed = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "notes", rows.RowIds[1],
+            [new() { Column = "body", Value = "changed" }]);
+        Assert.Equal("9007199254740993", changed.RowId);
+        Assert.Equal("changed", changed.Rows[0][0]);
+        Assert.Null(changed.Error);
+    }
+
+    [Fact]
+    public async Task TypedCells_RoundTripBlobsNumbersNullAndEmbeddedNullText()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db", "CREATE TABLE dynamic (a, b, c, d, e, f)");
+        var inserted = await fixture.Client.InsertDatabaseRecordAsync("app.db", "dynamic",
+        [
+            new() { Column = "a", Type = "integer", Value = "9223372036854775807" },
+            new() { Column = "b", Type = "real", Value = "1.5" },
+            new() { Column = "c", Type = "blob", Value = "AP8=" },
+            new() { Column = "d", Type = "null" },
+            new() { Column = "e", Type = "text", Value = "a\0b" },
+            new() { Column = "f", Type = "blob", Value = "" }
+        ]);
+        Assert.Null(inserted.Error);
+        Assert.Equal(["integer", "real", "blob", "null", "text", "blob"], inserted.Cells[0].Select(c => c.Type));
+        Assert.Equal(["9223372036854775807", "1.5", "AP8=", null, "a\0b", ""], inserted.Cells[0].Select(c => c.Value));
+        Assert.Equal("a\0b", inserted.Rows[0][4]);
+        var updated = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "dynamic", inserted.RowId!,
+            inserted.Cells[0].Select((c, i) => new SqliteCellBody
+            {
+                Column = inserted.Columns[i], Type = c.Type, Value = c.Value, Truncated = c.Truncated
+            }), inserted.RowVersion);
+        Assert.Null(updated.Error);
+        Assert.Equal(inserted.Cells[0].Select(c => (c.Type, c.Value)), updated.Cells[0].Select(c => (c.Type, c.Value)));
+    }
+
+    [Fact]
+    public async Task Rows_PaginateByRowidAndRejectStaleOrCrossTableCursors()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var first = await fixture.Client.ReadDatabaseRowsAsync("app.db", "people", maxRows: 1);
+        Assert.Equal(["1"], first.RowIds);
+        Assert.NotNull(first.NextCursor);
+        var second = await fixture.Client.ReadDatabaseRowsAsync("app.db", "people", 1, first.NextCursor);
+        Assert.Equal(["2"], second.RowIds);
+        Assert.False(second.Truncated);
+        Assert.Null(second.NextCursor);
+        var wrongTable = await fixture.Client.ReadDatabaseRowsAsync("app.db", "notes", 1, first.NextCursor);
+        Assert.Contains("cursor", wrongTable.Error);
+        await fixture.Client.QueryDatabaseAsync("app.db", "ALTER TABLE people ADD COLUMN more TEXT");
+        var stale = await fixture.Client.ReadDatabaseRowsAsync("app.db", "people", 1, first.NextCursor);
+        Assert.Contains("schema changed", stale.Error);
+    }
+
+    [Theory]
+    [InlineData("CREATE VIEW page AS SELECT name FROM people", "page", "Ada", "Grace")]
+    [InlineData("CREATE TABLE page (name TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO page VALUES ('b'), ('a')", "page", "a", "b")]
+    public async Task ReadOnlyRows_PaginateInDeterministicOrder(string sql, string table, string firstValue, string secondValue)
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.Client.QueryDatabaseAsync("app.db", sql);
+        var first = await fixture.Client.ReadDatabaseRowsAsync("app.db", table, 1);
+        var second = await fixture.Client.ReadDatabaseRowsAsync("app.db", table, 1, first.NextCursor);
+        Assert.Empty(first.RowIds);
+        Assert.Equal(firstValue, first.Rows[0][0]);
+        Assert.Equal(secondValue, second.Rows[0][0]);
+        Assert.Null(second.NextCursor);
+    }
+
+    [Fact]
+    public async Task ResultLimits_BoundRowsCellDataAndTheSerializedResponse()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var many = await fixture.Client.ExecuteDatabaseAsync("app.db",
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<2000) SELECT x FROM n",
+            int.MaxValue);
+        Assert.Equal(SqliteBrowser.MaxRows, many.Rows.Length);
+        Assert.True(many.Truncated);
+
+        var large = await fixture.Client.ExecuteDatabaseAsync("app.db", "SELECT zeroblob(100000), replace(hex(zeroblob(50000)), '0', 'a')");
+        Assert.Null(large.Error);
+        Assert.All(large.Cells[0], c => { Assert.True(c.Truncated); Assert.Null(c.Value); });
+
+        var bounded = await fixture.Client.ExecuteDatabaseAsync("app.db",
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100) SELECT replace(hex(zeroblob(16000)), '0', 'a') FROM n");
+        Assert.True(bounded.Truncated);
+        Assert.InRange(bounded.Rows.Length, 1, 99);
+        Assert.True(JsonSerializer.SerializeToUtf8Bytes(bounded, StorageJsonContext.Default.SqliteQueryResponse).Length <= SqliteBrowser.MaxResponseBytes);
+        var refused = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "people", "1",
+            [new() { Column = "name", Type = "text", Value = null, Truncated = true }]);
+        Assert.Contains("truncated", refused.Error);
+    }
+
+    [Fact]
+    public async Task OptimisticWrites_RejectChangedRowsWithoutOverwritingTheApp()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var rows = await fixture.Client.ReadDatabaseRowsAsync("app.db", "counters");
+        await fixture.Client.QueryDatabaseAsync("app.db", "UPDATE counters SET value = 42");
+        var update = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "counters", "1",
+            [new() { Column = "value", Value = "7" }], rows.RowVersions[0]);
+        Assert.Equal("conflict", update.ErrorCode);
+        var delete = await fixture.Client.DeleteDatabaseRecordAsync("app.db", "counters", "1", rows.RowVersions[0]);
+        Assert.Equal("conflict", delete.ErrorCode);
+        var stored = await fixture.Client.ReadDatabaseRowsAsync("app.db", "counters");
+        Assert.Equal("42", stored.Rows[0][1]);
+        var allowed = await fixture.Client.DeleteDatabaseRecordAsync("app.db", "counters", "1", stored.RowVersions[0]);
+        Assert.Null(allowed.Error);
+        Assert.Equal(1, allowed.RowsAffected);
+    }
+
+    [Fact]
+    public async Task Update_ChangingIntegerPrimaryKeyReturnsTheNewIdentity()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var result = await fixture.Client.UpdateDatabaseRecordAsync("app.db", "people", "1",
+            [new() { Column = "id", Type = "integer", Value = "42" }]);
+        Assert.Null(result.Error);
+        Assert.Equal("42", result.RowId);
+        Assert.Equal("Ada", result.Rows[0][1]);
+    }
+
+    [Fact]
+    public async Task HostConfiguration_RunsBeforeValidationAndOnReadOnlyConnections()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var seen = new List<bool>();
+        var options = new SqliteBrowserOptions
+        {
+            ConfigureConnection = connection =>
+            {
+                Assert.Equal(fixture.DatabasePath, connection.Path);
+                seen.Add(connection.IsReadOnly);
+                connection.Execute("PRAGMA cache_size = 16");
+            },
+            InitializeProvider = () => throw new InvalidOperationException("An existing provider must not be replaced.")
+        };
+        Assert.NotEmpty(SqliteBrowser.ReadSchema(fixture.DatabasePath, options: options).Tables);
+        var result = SqliteBrowser.Query(fixture.DatabasePath, "PRAGMA cache_size", 1, options: options);
+        Assert.Equal("16", result.Rows[0][0]);
+        Assert.Equal([true, false], seen);
+    }
+
+    [Fact]
+    public async Task Cancellation_InterruptsAQueryAndDoesNotHoldTheDatabaseLock()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var result = await Task.Run(() => SqliteBrowser.Query(fixture.DatabasePath,
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n) SELECT count(*) FROM n",
+            1, cancellationToken: cancel.Token)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("cancelled", result.ErrorCode);
+        Assert.NotEmpty(SqliteBrowser.ReadSchema(fixture.DatabasePath).Tables);
+    }
+
+    [Fact]
+    public async Task Cancellation_StopsWaitingForAnAppOwnedLock()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await using var owner = new SqliteConnection($"Data Source={fixture.DatabasePath};Pooling=False");
+        await owner.OpenAsync();
+        await using var command = owner.CreateCommand();
+        command.CommandText = "BEGIN EXCLUSIVE";
+        await command.ExecuteNonQueryAsync();
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var result = await Task.Run(() => SqliteBrowser.ReadRows(fixture.DatabasePath, "people", 1,
+            cancellationToken: cancel.Token)).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("cancelled", result.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ConfiguredDeadline_ReturnsASqlErrorBeforeTheHttpClientTimesOut()
+    {
+        await using var fixture = await Fixture.CreateAsync(TimeSpan.FromMilliseconds(100));
+        var result = await fixture.Client.ExecuteDatabaseAsync("app.db",
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n) SELECT count(*) FROM n");
+        Assert.Equal("timeout", result.ErrorCode);
+        Assert.Contains("was stopped", result.Error);
+    }
+
     /// <summary>A view that never produces a row: counting upward, forever, for a number below zero.</summary>
     private const string EndlessView =
         "CREATE VIEW endless AS WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n WHERE x < 0";
@@ -478,7 +721,7 @@ public class SqliteBrowserTests
         public string Root { get; }
         public string DatabasePath => Path.Combine(Root, "app.db");
 
-        public static async Task<Fixture> CreateAsync()
+        public static async Task<Fixture> CreateAsync(TimeSpan? timeout = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "devflow-sqlite-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -486,7 +729,7 @@ public class SqliteBrowserTests
             await SeedAsync(Path.Combine(root, "app.db"));
 
             var port = GetFreePort();
-            var service = new RootedAgentService(port, root);
+            var service = new RootedAgentService(port, root, timeout);
             service.StartServerOnly(Immediate);
 
             var client = new AgentClient("localhost", port);
@@ -548,11 +791,15 @@ public class SqliteBrowserTests
     {
         private readonly string _root;
 
-        public RootedAgentService(int port, string root)
+        public RootedAgentService(int port, string root, TimeSpan? timeout = null)
             // Leases stay on, as they are by default: every write route here has to get through the
             // same gate a real session puts it behind, or a client that forgets to claim one passes.
             : base(new AgentOptions { Port = port })
-            => _root = root;
+        {
+            _root = root;
+            if (timeout.HasValue)
+                _options.Sqlite.Timeout = timeout.Value;
+        }
 
         protected override string GetAppDataBasePath() => _root;
 

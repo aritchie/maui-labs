@@ -1,4 +1,6 @@
 using SQLitePCL;
+using System.Text;
+using System.Diagnostics;
 
 namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
 
@@ -28,10 +30,11 @@ internal sealed class SqliteDatabase : IDisposable
     private readonly CancellationTokenSource _deadline;
     private readonly CancellationTokenRegistration _interrupt;
 
-    private SqliteDatabase(sqlite3 handle, TimeSpan timeout)
+    private SqliteDatabase(sqlite3 handle, TimeSpan timeout, CancellationToken cancellationToken)
     {
         Handle = handle;
-        _deadline = new CancellationTokenSource(timeout);
+        _deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _deadline.CancelAfter(timeout);
 
         // sqlite3_interrupt stops whatever is running when the deadline passes. It does nothing for a
         // statement started afterwards, which is why every prepare and step checks the deadline as well.
@@ -51,8 +54,11 @@ internal sealed class SqliteDatabase : IDisposable
     public int TotalChanges => raw.sqlite3_total_changes(Handle);
 
     /// <exception cref="InvalidOperationException">SQLite would not open the file.</exception>
-    public static SqliteDatabase Open(string fullPath, int flags, TimeSpan timeout)
+    public static SqliteDatabase Open(string fullPath, int flags, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
+        if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(25))
+            throw new InvalidOperationException("SQLite timeout must be positive and at most 25 seconds.");
+        cancellationToken.ThrowIfCancellationRequested();
         var rc = raw.sqlite3_open_v2(fullPath, out var handle, flags, null);
         if (rc != raw.SQLITE_OK)
         {
@@ -64,8 +70,22 @@ internal sealed class SqliteDatabase : IDisposable
             throw new InvalidOperationException(message);
         }
 
-        raw.sqlite3_busy_timeout(handle, BusyTimeoutMilliseconds);
-        return new SqliteDatabase(handle, timeout);
+        raw.sqlite3_limit(handle, raw.SQLITE_LIMIT_LENGTH, 8 * 1024 * 1024);
+        raw.sqlite3_busy_timeout(handle, 50);
+        return new SqliteDatabase(handle, timeout, cancellationToken);
+    }
+
+    internal int RetryBusy(Func<int> action)
+    {
+        var wait = Stopwatch.StartNew();
+        while (true)
+        {
+            ThrowIfExpired();
+            var result = action();
+            if ((result & 0xFF) != raw.SQLITE_BUSY || wait.ElapsedMilliseconds >= BusyTimeoutMilliseconds)
+                return result;
+            Thread.Sleep(10);
+        }
     }
 
     /// <summary>Prepares one statement, which must be all of <paramref name="sql"/>.</summary>
@@ -74,14 +94,25 @@ internal sealed class SqliteDatabase : IDisposable
     {
         ThrowIfExpired();
 
-        var rc = raw.sqlite3_prepare_v2(Handle, sql, out var statement);
-        if (rc != raw.SQLITE_OK)
+        sqlite3_stmt? statement = null;
+        try
+        {
+            var rc = RetryBusy(() =>
+            {
+                statement?.Dispose();
+                return raw.sqlite3_prepare_v2(Handle, sql, out statement);
+            });
+            if (rc != raw.SQLITE_OK)
+                throw Error(rc);
+            if (statement is null || statement.IsInvalid)
+                throw new InvalidOperationException("A SQL statement is required.");
+            return new SqliteStatement(this, statement);
+        }
+        catch
         {
             statement?.Dispose();
-            throw Error(rc);
+            throw;
         }
-
-        return new SqliteStatement(this, statement);
     }
 
     /// <summary>
@@ -94,7 +125,23 @@ internal sealed class SqliteDatabase : IDisposable
         {
             ThrowIfExpired();
 
-            var rc = raw.sqlite3_prepare_v2(Handle, sql, out var statement, out string tail);
+            sqlite3_stmt? statement = null;
+            var current = sql;
+            string tail = "";
+            int rc;
+            try
+            {
+                rc = RetryBusy(() =>
+                {
+                    statement?.Dispose();
+                    return raw.sqlite3_prepare_v2(Handle, current, out statement, out tail);
+                });
+            }
+            catch
+            {
+                statement?.Dispose();
+                throw;
+            }
             if (rc != raw.SQLITE_OK)
             {
                 statement?.Dispose();
@@ -137,7 +184,7 @@ internal sealed class SqliteDatabase : IDisposable
         var code = rc & 0xFF;
 
         // An interrupted statement is the deadline, whatever step it happened to be caught at.
-        if (code == raw.SQLITE_INTERRUPT)
+        if (code == raw.SQLITE_INTERRUPT || _deadline.IsCancellationRequested)
             return new OperationCanceledException();
 
         return new SqliteError(code, raw.sqlite3_errmsg(Handle).utf8_to_string() ?? raw.sqlite3_errstr(rc).utf8_to_string() ?? "");
@@ -177,7 +224,7 @@ internal sealed class SqliteStatement : IDisposable
     {
         _database.ThrowIfExpired();
 
-        var rc = raw.sqlite3_step(_handle);
+        var rc = _database.RetryBusy(() => raw.sqlite3_step(_handle));
         return rc switch
         {
             raw.SQLITE_ROW => true,
@@ -198,6 +245,14 @@ internal sealed class SqliteStatement : IDisposable
     public void Bind(string name, long value)
         => Check(raw.sqlite3_bind_int64(_handle, ParameterIndex(name), value));
 
+    public void Bind(string name, double value)
+        => Check(raw.sqlite3_bind_double(_handle, ParameterIndex(name), value));
+
+    public void BindBlob(string name, byte[] value)
+        => Check(value.Length == 0
+            ? raw.sqlite3_bind_zeroblob(_handle, ParameterIndex(name), 0)
+            : raw.sqlite3_bind_blob(_handle, ParameterIndex(name), value));
+
     public string ColumnName(int index) => raw.sqlite3_column_name(_handle, index).utf8_to_string() ?? "";
 
     public int ColumnType(int index) => raw.sqlite3_column_type(_handle, index);
@@ -212,9 +267,11 @@ internal sealed class SqliteStatement : IDisposable
 
     public double GetDouble(int index) => raw.sqlite3_column_double(_handle, index);
 
-    public string GetString(int index) => raw.sqlite3_column_text(_handle, index).utf8_to_string() ?? "";
+    public string GetString(int index) => Encoding.UTF8.GetString(raw.sqlite3_column_blob(_handle, index));
 
     public ReadOnlySpan<byte> GetBlob(int index) => raw.sqlite3_column_blob(_handle, index);
+
+    public int GetByteLength(int index) => raw.sqlite3_column_bytes(_handle, index);
 
     private int ParameterIndex(string name)
     {

@@ -1,4 +1,8 @@
 using Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
+using Microsoft.Maui.DevFlow.Driver;
+using System.Text;
+using System.Text.Json;
+using System.Diagnostics;
 
 namespace Microsoft.Maui.DevFlow.Agent.Core;
 
@@ -8,8 +12,6 @@ namespace Microsoft.Maui.DevFlow.Agent.Core;
 /// </summary>
 public partial class DevFlowAgentService
 {
-    private const string SqliteApi = "/api/v1/storage/sqlite";
-
     /// <summary>
     /// The cap that keeps a <c>SELECT *</c> against a million rows from being the answer to a
     /// question nobody asked. Results say whether it bit.
@@ -18,13 +20,48 @@ public partial class DevFlowAgentService
 
     private void MapSqliteRoutes()
     {
-        _server.MapGet($"{SqliteApi}/schema", HandleSqliteSchema);
-        _server.MapPost($"{SqliteApi}/query", HandleSqliteQuery);
-        _server.MapGet($"{SqliteApi}/rows", HandleSqliteRows);
-        _server.MapPost($"{SqliteApi}/rows", HandleSqliteInsertRow);
-        _server.MapPut($"{SqliteApi}/rows", HandleSqliteUpdateRow);
-        _server.MapPost($"{SqliteApi}/rows/delete", HandleSqliteDeleteRow);
-        _server.MapPost($"{SqliteApi}/create", HandleSqliteCreate);
+        _server.MapGet("/api/v1/storage/sqlite/schema", r => RunSqliteAsync(r, HandleSqliteSchema));
+        _server.MapPost("/api/v1/storage/sqlite/query", r => RunSqliteAsync(r, HandleSqliteQuery));
+        _server.MapGet("/api/v1/storage/sqlite/rows", r => RunSqliteAsync(r, HandleSqliteRows));
+        _server.MapPost("/api/v1/storage/sqlite/rows", r => RunSqliteAsync(r, HandleSqliteInsertRow));
+        _server.MapPut("/api/v1/storage/sqlite/rows", r => RunSqliteAsync(r, HandleSqliteUpdateRow));
+        _server.MapPost("/api/v1/storage/sqlite/rows/delete", r => RunSqliteAsync(r, HandleSqliteDeleteRow));
+        _server.MapPost("/api/v1/storage/sqlite/create", r => RunSqliteAsync(r, HandleSqliteCreate));
+    }
+
+    private Task<HttpResponse> RunSqliteAsync(HttpRequest request, Func<HttpRequest, Task<HttpResponse>> handler)
+    {
+        if (!SqliteGateway.IsAvailable(out var reason) && _options.Sqlite.InitializeProvider is null)
+            return Task.FromResult(NotSupported("storage.sqlite", reason));
+        return Task.Run(async () =>
+        {
+            var response = await handler(request).ConfigureAwait(false);
+            if (response.Body is not null && Encoding.UTF8.GetByteCount(response.Body) > SqliteBrowser.MaxResponseBytes)
+                return HttpResponse.Error("The SQLite response exceeds the 1 MiB limit. Select fewer columns or rows.", 413);
+            return response;
+        }, request.CancellationToken);
+    }
+
+    private static HttpResponse SqliteFault(string message, Exception exception)
+    {
+        if (exception is JsonException)
+            return HttpResponse.Error("Invalid JSON request body.");
+        if (exception is OperationCanceledException)
+            return HttpResponse.Error("The database request was cancelled.", 408);
+        Console.Error.WriteLine($"[Microsoft.Maui.DevFlow.Agent] {message}: {exception.GetType().Name}");
+        return HttpResponse.Error(message, 500);
+    }
+
+    private TimeSpan SqliteTimeout(HttpRequest request)
+    {
+        var configured = _options.Sqlite.Timeout;
+        if (configured <= TimeSpan.Zero || configured > TimeSpan.FromSeconds(25))
+            throw new InvalidOperationException("SQLite timeout must be positive and at most 25 seconds.");
+        // Admission and body reads also consume the transport budget.
+        var remaining = TimeSpan.FromSeconds(25) - Stopwatch.GetElapsedTime(request.StartedAt);
+        if (remaining <= TimeSpan.Zero)
+            throw new OperationCanceledException();
+        return remaining < configured ? remaining : configured;
     }
 
     /// <summary>
@@ -53,7 +90,7 @@ public partial class DevFlowAgentService
     }
 
     private static string? ReadRequestedPath(HttpRequest request)
-        => request.BodyAs(AgentJsonContext.Default.SqliteRequestBody)?.Path;
+        => request.BodyAs(StorageAgentJsonContext.Default.SqliteRequestBody)?.Path;
 
     private Task<HttpResponse> HandleSqliteSchema(HttpRequest request)
     {
@@ -61,7 +98,8 @@ public partial class DevFlowAgentService
         {
             var fullPath = ResolveDatabasePath(request, writing: false);
             return Task.FromResult(HttpResponse.Json(
-                SqliteBrowser.ReadSchema(fullPath), AgentJsonContext.Default.SqliteSchemaResponse));
+                SqliteBrowser.ReadSchema(fullPath, SqliteTimeout(request), request.CancellationToken, _options.Sqlite),
+                StorageAgentJsonContext.Default.SqliteSchemaResponse));
         }
         catch (FileNotFoundException ex)
         {
@@ -71,9 +109,9 @@ public partial class DevFlowAgentService
         {
             return Task.FromResult(HttpResponse.Error(ex.Message));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return Task.FromResult(HttpResponse.Error("Failed to read the database schema"));
+            return Task.FromResult(SqliteFault("Failed to read the database schema", ex));
         }
     }
 
@@ -81,7 +119,7 @@ public partial class DevFlowAgentService
     {
         try
         {
-            var body = request.BodyAs(AgentJsonContext.Default.SqliteQueryBody);
+            var body = request.BodyAs(StorageAgentJsonContext.Default.SqliteQueryBody);
             if (body == null || string.IsNullOrWhiteSpace(body.Sql))
                 return Task.FromResult(HttpResponse.Error("Request body must include 'sql'"));
 
@@ -94,8 +132,8 @@ public partial class DevFlowAgentService
             var maxRows = body.MaxRows is > 0 ? body.MaxRows.Value : DefaultSqliteMaxRows;
 
             return Task.FromResult(HttpResponse.Json(
-                SqliteBrowser.Query(fullPath, body.Sql, maxRows),
-                AgentJsonContext.Default.SqliteQueryResponse));
+                SqliteBrowser.Query(fullPath, body.Sql, maxRows, SqliteTimeout(request), request.CancellationToken, _options.Sqlite),
+                StorageAgentJsonContext.Default.SqliteQueryResponse));
         }
         catch (FileNotFoundException ex)
         {
@@ -105,9 +143,9 @@ public partial class DevFlowAgentService
         {
             return Task.FromResult(HttpResponse.Error(ex.Message));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return Task.FromResult(HttpResponse.Error("Failed to run the statement"));
+            return Task.FromResult(SqliteFault("Failed to run the statement", ex));
         }
     }
 
@@ -123,7 +161,8 @@ public partial class DevFlowAgentService
             var maxRows = ParsePositiveInt(request.QueryParams.GetValueOrDefault("maxRows")) ?? DefaultSqliteMaxRows;
 
             return Task.FromResult(HttpResponse.Json(
-                SqliteBrowser.ReadRows(fullPath, table, maxRows), AgentJsonContext.Default.SqliteRowsResponse));
+                SqliteBrowser.ReadRows(fullPath, table, maxRows, SqliteTimeout(request), cursor: request.QueryParams.GetValueOrDefault("cursor"),
+                    cancellationToken: request.CancellationToken, options: _options.Sqlite), StorageAgentJsonContext.Default.SqliteRowsResponse));
         }
         catch (FileNotFoundException ex)
         {
@@ -133,16 +172,17 @@ public partial class DevFlowAgentService
         {
             return Task.FromResult(HttpResponse.Error(ex.Message));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return Task.FromResult(HttpResponse.Error("Failed to read the table"));
+            return Task.FromResult(SqliteFault("Failed to read the table", ex));
         }
     }
 
     private Task<HttpResponse> HandleSqliteInsertRow(HttpRequest request)
     {
         return WithRowRequest(request, (fullPath, body)
-            => SqliteBrowser.InsertRow(fullPath, body.Table!, ToEdits(body.Values)));
+            => SqliteBrowser.InsertRow(fullPath, body.Table!, ToEdits(body.Values), SqliteTimeout(request),
+                cancellationToken: request.CancellationToken, options: _options.Sqlite));
     }
 
     private Task<HttpResponse> HandleSqliteUpdateRow(HttpRequest request)
@@ -152,7 +192,8 @@ public partial class DevFlowAgentService
             if (body.RowId is not { } rowId)
                 throw new InvalidOperationException("Request body must include 'rowId'");
 
-            return SqliteBrowser.UpdateRow(fullPath, body.Table!, rowId, ToEdits(body.Values));
+            return SqliteBrowser.UpdateRow(fullPath, body.Table!, SqliteBrowser.ParseRowId(rowId), ToEdits(body.Values), SqliteTimeout(request),
+                expectedVersion: body.ExpectedVersion, cancellationToken: request.CancellationToken, options: _options.Sqlite);
         });
     }
 
@@ -163,7 +204,8 @@ public partial class DevFlowAgentService
             if (body.RowId is not { } rowId)
                 throw new InvalidOperationException("Request body must include 'rowId'");
 
-            return SqliteBrowser.DeleteRow(fullPath, body.Table!, rowId);
+            return SqliteBrowser.DeleteRow(fullPath, body.Table!, SqliteBrowser.ParseRowId(rowId), SqliteTimeout(request),
+                expectedVersion: body.ExpectedVersion, cancellationToken: request.CancellationToken, options: _options.Sqlite);
         });
     }
 
@@ -172,12 +214,12 @@ public partial class DevFlowAgentService
     {
         try
         {
-            var body = request.BodyAs(AgentJsonContext.Default.SqliteRowBody);
+            var body = request.BodyAs(StorageAgentJsonContext.Default.SqliteRowBody);
             if (body == null || string.IsNullOrWhiteSpace(body.Table))
                 return Task.FromResult(HttpResponse.Error("Request body must include 'table'"));
 
             var fullPath = ResolveDatabasePath(request, writing: true);
-            return Task.FromResult(HttpResponse.Json(act(fullPath, body), AgentJsonContext.Default.SqliteQueryResponse));
+            return Task.FromResult(HttpResponse.Json(act(fullPath, body), StorageAgentJsonContext.Default.SqliteQueryResponse));
         }
         catch (FileNotFoundException ex)
         {
@@ -187,9 +229,9 @@ public partial class DevFlowAgentService
         {
             return Task.FromResult(HttpResponse.Error(ex.Message));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return Task.FromResult(HttpResponse.Error("Failed to change the record"));
+            return Task.FromResult(SqliteFault("Failed to change the record", ex));
         }
     }
 
@@ -203,7 +245,7 @@ public partial class DevFlowAgentService
         {
             var root = ResolveFileStorageRoot(request, FileStorageOperationUpload);
 
-            var body = request.BodyAs(AgentJsonContext.Default.SqliteRequestBody);
+            var body = request.BodyAs(StorageAgentJsonContext.Default.SqliteRequestBody);
             if (body == null || string.IsNullOrWhiteSpace(body.Path))
                 return Task.FromResult(HttpResponse.Error("Request body must include 'path'"));
 
@@ -217,7 +259,7 @@ public partial class DevFlowAgentService
             if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
                 Directory.CreateDirectory(directory);
 
-            SqliteGateway.Create(resolved.FullPath);
+            SqliteGateway.Create(resolved.FullPath, request.CancellationToken, _options.Sqlite, SqliteTimeout(request));
 
             return Task.FromResult(HttpResponse.Json(
                 new SqliteCreatedResponse
@@ -227,21 +269,28 @@ public partial class DevFlowAgentService
                     Path = resolved.RelativePath,
                     Size = new FileInfo(resolved.FullPath).Length
                 },
-                AgentJsonContext.Default.SqliteCreatedResponse));
+                StorageAgentJsonContext.Default.SqliteCreatedResponse));
         }
         catch (InvalidOperationException ex)
         {
             return Task.FromResult(HttpResponse.Error(ex.Message));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return Task.FromResult(HttpResponse.Error("Failed to create the database"));
+            return Task.FromResult(SqliteFault("Failed to create the database", ex));
         }
     }
 
     private static IReadOnlyList<SqliteCellEdit> ToEdits(SqliteCellBody[]? cells)
-        => cells?.Select(x => new SqliteCellEdit(x.Column, x.Value)).ToArray() ?? [];
+        => cells?.Select(x => x is null ? throw new InvalidOperationException("A cell cannot be null.")
+            : new SqliteCellEdit(x.Column, x.Value, x.Type, x.Truncated)).ToArray() ?? [];
 
     private static int? ParsePositiveInt(string? text)
-        => int.TryParse(text, out var value) && value > 0 ? value : null;
+    {
+        if (text is null)
+            return null;
+        if (!int.TryParse(text, out var value))
+            throw new InvalidOperationException("maxRows must be a 32-bit integer.");
+        return value > 0 ? value : null;
+    }
 }

@@ -1,5 +1,9 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Maui.DevFlow.Driver;
 using SQLitePCL;
 
 namespace Microsoft.Maui.DevFlow.Agent.Core.Sqlite;
@@ -38,6 +42,9 @@ internal static class SqliteBrowser
     /// megabyte of jpeg in one, and shipping it would cost the row it is in.
     /// </summary>
     private const int BlobPreview = 32;
+    internal const int MaxRows = 1000;
+    internal const int MaxCellBytes = 64 * 1024;
+    internal const int MaxResponseBytes = 1024 * 1024;
 
     /// <summary>
     /// The three names SQLite answers to for a table's rowid, in the order they are tried.
@@ -47,11 +54,12 @@ internal static class SqliteBrowser
     // ── Schema ──
 
     /// <exception cref="InvalidOperationException">The file could not be read as a database, or the read ran past the deadline.</exception>
-    public static SqliteSchemaResponse ReadSchema(string fullPath, TimeSpan? timeout = null)
+    public static SqliteSchemaResponse ReadSchema(string fullPath, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options, readOnly: true);
 
             var names = new List<(string Name, string Kind)>();
 
@@ -75,13 +83,13 @@ internal static class SqliteBrowser
                 {
                     Name = x.Name,
                     Kind = x.Kind,
-                    Columns = ReadColumns(database, x.Name).Select(Describe).ToArray(),
+                    Columns = ReadColumns(database, x.Name).Select(c => Describe(c, x.Kind == "table")).ToArray(),
 
                     // A view has no indexes and cannot be given any. PRAGMA index_list answers for one
                     // with an empty list rather than an error, so this is skipped for the answer it
                     // would give rather than for the error it would raise.
                     Indexes = x.Kind == "table" ? ReadIndexes(database, x.Name) : [],
-                    HasRowId = RowIdAlias(database, x.Name) is not null
+                    HasRowId = x.Kind == "table" && RowIdAlias(database, x.Name) is not null
                 })
                 .ToArray();
 
@@ -94,7 +102,8 @@ internal static class SqliteBrowser
         }
         catch (OperationCanceledException)
         {
-            throw new InvalidOperationException(TimedOut(timeout));
+            throw new InvalidOperationException(cancellationToken.IsCancellationRequested
+                ? "The database request was cancelled." : TimedOut(timeout ?? options?.Timeout));
         }
         catch (SqliteError ex)
         {
@@ -104,18 +113,19 @@ internal static class SqliteBrowser
 
     // ── Query ──
 
-    public static SqliteQueryResponse Query(string fullPath, string sql, int maxRows, TimeSpan? timeout = null)
+    public static SqliteQueryResponse Query(string fullPath, string sql, int maxRows, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
-            return RunScript(database, sql, maxRows, watch);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options);
+            return RunScript(database, sql, LimitRows(maxRows), watch);
         }
         catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex, timeout));
+            return Failed(watch, Describe(ex, timeout ?? options?.Timeout, cancellationToken), ErrorCode(ex, cancellationToken));
         }
     }
 
@@ -123,6 +133,8 @@ internal static class SqliteBrowser
     {
         var columns = Array.Empty<string>();
         var rows = new List<string?[]>();
+        var cells = new List<SqliteValue[]>();
+        var budget = new ResultBudget();
         var truncated = false;
         var shown = false;
 
@@ -145,18 +157,22 @@ internal static class SqliteBrowser
                 {
                     shown = true;
                     columns = Enumerable.Range(0, statement.ColumnCount).Select(statement.ColumnName).ToArray();
+                    budget.AddColumns(columns);
 
                     while (statement.Step())
                     {
-                        if (rows.Count == maxRows)
+                        if (truncated || rows.Count == maxRows || !budget.TryAddRow(ReadRow(statement), out var row))
                         {
                             // Asked for, not read: there is one more row than the cap, which is what lets
                             // the client say "first 500 of more" rather than "500".
                             truncated = true;
-                            break;
+                            if (statement.IsReadOnly)
+                                break;
+                            continue;
                         }
 
-                        rows.Add(ReadRow(statement));
+                        rows.Add(row.Display);
+                        cells.Add(row.Cells);
                     }
                 }
                 else
@@ -176,51 +192,67 @@ internal static class SqliteBrowser
             }
         }
 
-        return Result(columns, rows.ToArray(), shown ? -1 : affected, truncated, watch, null);
+        var result = Result(columns, rows.ToArray(), shown ? -1 : affected, truncated, watch, null);
+        result.Cells = cells.ToArray();
+        return result;
     }
 
     // ── Rows ──
 
-    public static SqliteRowsResponse ReadRows(string fullPath, string table, int maxRows, TimeSpan? timeout = null)
+    public static SqliteRowsResponse ReadRows(string fullPath, string table, int maxRows, TimeSpan? timeout = null,
+        string? cursor = null, CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options, readOnly: true);
+            maxRows = LimitRows(maxRows);
 
             // A view is selectable but not editable, and this route feeds the grid in both cases -
             // so it takes either, and the absence of rowids in the answer is what tells the client
             // which it got.
             var name = RequireSelectable(database, table);
             var alias = RowIdAlias(database, name);
+            var schemaVersion = SchemaVersion(database);
+            var page = DecodeCursor(cursor, fullPath, name, schemaVersion);
+            var order = alias ?? string.Join(", ", ReadColumns(database, name).Where(x => !x.IsHidden)
+                .Select(x => Quote(x.Name)));
+            var where = alias is not null && page.AfterRowId is not null ? $" WHERE {alias} > $after" : "";
+            var projection = alias is null ? "*" : $"{alias}, *";
 
-            // The rowid first and by itself, rather than folded into the * that follows it, under a
-            // name no column of the table has taken - see RowIdAlias.
-            using var statement = database.Prepare(alias is null
-                ? $"SELECT * FROM {Quote(name)} LIMIT $take"
-                : $"SELECT {alias}, * FROM {Quote(name)} LIMIT $take");
+            using var statement = database.Prepare(
+                $"SELECT {projection} FROM {Quote(name)}{where} ORDER BY {order} LIMIT $take OFFSET $skip");
 
             statement.Bind("$take", maxRows + 1L);
+            statement.Bind("$skip", alias is null ? page.Offset : 0);
+            if (where.Length > 0)
+                statement.Bind("$after", ParseRowId(page.AfterRowId!));
 
             var offset = alias is null ? 0 : 1;
             var columns = Enumerable.Range(offset, statement.ColumnCount - offset).Select(statement.ColumnName).ToArray();
-            var ids = new List<long>();
+            var ids = new List<string>();
+            var versions = new List<string>();
             var rows = new List<string?[]>();
+            var cells = new List<SqliteValue[]>();
             var truncated = false;
+            var budget = new ResultBudget();
+            budget.AddColumns(columns);
 
             while (statement.Step())
             {
-                if (rows.Count == maxRows)
+                if (rows.Count == maxRows || !budget.TryAddRow(ReadRow(statement, offset), out var row))
                 {
                     truncated = true;
                     break;
                 }
 
                 if (alias is not null)
-                    ids.Add(statement.GetInt64(0));
+                    ids.Add(statement.GetInt64(0).ToString(CultureInfo.InvariantCulture));
 
-                rows.Add(ReadRow(statement, offset));
+                rows.Add(row.Display);
+                cells.Add(row.Cells);
+                versions.Add(row.Version);
             }
 
             return new SqliteRowsResponse
@@ -228,6 +260,13 @@ internal static class SqliteBrowser
                 Columns = columns,
                 RowIds = ids.ToArray(),
                 Rows = rows.ToArray(),
+                Cells = cells.ToArray(),
+                RowVersions = versions.ToArray(),
+                NextCursor = truncated ? EncodeCursor(new SqlitePageCursor
+                {
+                    Database = DatabaseKey(fullPath), Table = name, SchemaVersion = schemaVersion,
+                    AfterRowId = ids.LastOrDefault(), Offset = checked(page.Offset + rows.Count)
+                }) : null,
                 Truncated = truncated,
                 ElapsedMs = watch.ElapsedMilliseconds,
                 Error = null
@@ -238,18 +277,21 @@ internal static class SqliteBrowser
             return new SqliteRowsResponse
             {
                 ElapsedMs = watch.ElapsedMilliseconds,
-                Error = Describe(ex, timeout)
+                Error = Describe(ex, timeout ?? options?.Timeout, cancellationToken),
+                ErrorCode = ErrorCode(ex, cancellationToken)
             };
         }
     }
 
-    public static SqliteQueryResponse InsertRow(string fullPath, string table, IReadOnlyList<SqliteCellEdit> values, TimeSpan? timeout = null)
+    public static SqliteQueryResponse InsertRow(string fullPath, string table, IReadOnlyList<SqliteCellEdit> values, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options);
+            database.Execute("BEGIN IMMEDIATE");
 
             // The table and every column name are taken from the database's own schema rather than
             // from the request, because an identifier cannot be a parameter and the only safe
@@ -258,13 +300,16 @@ internal static class SqliteBrowser
             var columns = ReadColumns(database, name);
 
             var quoted = new List<string>();
-            var parameters = new List<(string Name, string? Value)>();
+            var parameters = new List<(string Name, SqliteCellEdit Edit)>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
 
             for (var i = 0; i < values.Count; i++)
             {
                 var column = FindColumn(columns, name, values[i].Column);
+                if (!seen.Add(column))
+                    throw new InvalidOperationException($"Column '{column}' is repeated.");
                 quoted.Add(Quote(column));
-                parameters.Add(($"$v{i}", values[i].Value));
+                parameters.Add(($"$v{i}", values[i]));
             }
 
             // DEFAULT VALUES rather than an empty column list, which is not valid SQL. It is the
@@ -273,8 +318,8 @@ internal static class SqliteBrowser
                 ? $"INSERT INTO {Quote(name)} DEFAULT VALUES"
                 : $"INSERT INTO {Quote(name)} ({string.Join(", ", quoted)}) VALUES ({string.Join(", ", parameters.Select(x => x.Name))})"))
             {
-                foreach (var (parameter, value) in parameters)
-                    statement.Bind(parameter, value);
+                foreach (var (parameter, edit) in parameters)
+                    BindEdit(statement, parameter, edit);
 
                 while (statement.Step())
                 {
@@ -290,17 +335,20 @@ internal static class SqliteBrowser
 
             // A table with no rowid to name has nothing to read back by - the insert worked, and there
             // is no id that names what it wrote. The count is the whole answer, and the grid re-reads.
-            return RowIdAlias(database, name) is { } alias
+            var result = RowIdAlias(database, name) is { } alias
                 ? ReadBack(database, name, alias, rowId, affected, watch)
                 : Result([], [], affected, false, watch, null);
+            database.Execute("COMMIT");
+            return result;
         }
         catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex, timeout));
+            return Failed(watch, Describe(ex, timeout ?? options?.Timeout, cancellationToken), ErrorCode(ex, cancellationToken));
         }
     }
 
-    public static SqliteQueryResponse UpdateRow(string fullPath, string table, long rowId, IReadOnlyList<SqliteCellEdit> changes, TimeSpan? timeout = null)
+    public static SqliteQueryResponse UpdateRow(string fullPath, string table, long rowId, IReadOnlyList<SqliteCellEdit> changes, TimeSpan? timeout = null,
+        string? expectedVersion = null, CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         var watch = Stopwatch.StartNew();
 
@@ -309,35 +357,41 @@ internal static class SqliteBrowser
 
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options);
+            database.Execute("BEGIN IMMEDIATE");
 
             var name = RequireTable(database, table);
             var columns = ReadColumns(database, name);
             var alias = RequireRowIdAlias(database, name);
+            CheckVersion(database, name, alias, rowId, expectedVersion);
 
             var assignments = new List<string>();
-            var parameters = new List<(string Name, string? Value)>();
+            var parameters = new List<(string Name, SqliteCellEdit Edit)>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
 
             for (var i = 0; i < changes.Count; i++)
             {
                 var column = FindColumn(columns, name, changes[i].Column);
+                if (!seen.Add(column))
+                    throw new InvalidOperationException($"Column '{column}' is repeated.");
                 assignments.Add($"{Quote(column)} = $v{i}");
-                parameters.Add(($"$v{i}", changes[i].Value));
+                parameters.Add(($"$v{i}", changes[i]));
             }
 
             using (var statement = database.Prepare(
-                $"UPDATE {Quote(name)} SET {string.Join(", ", assignments)} WHERE {alias} = $rowid"))
+                $"UPDATE {Quote(name)} SET {string.Join(", ", assignments)} WHERE {alias} = $rowid RETURNING {alias}"))
             {
                 // The text goes in as text and SQLite applies the column's affinity to it, so "42"
                 // typed into an INTEGER column is stored as the number 42 - which is why the row is
                 // read back below rather than assumed.
-                foreach (var (parameter, value) in parameters)
-                    statement.Bind(parameter, value);
+                foreach (var (parameter, edit) in parameters)
+                    BindEdit(statement, parameter, edit);
 
                 statement.Bind("$rowid", rowId);
 
                 while (statement.Step())
                 {
+                    rowId = statement.GetInt64(0);
                 }
             }
 
@@ -350,23 +404,28 @@ internal static class SqliteBrowser
                 return Failed(watch, "That record is no longer there. Refresh the table.");
             }
 
-            return ReadBack(database, name, alias, rowId, affected, watch);
+            var result = ReadBack(database, name, alias, rowId, affected, watch);
+            database.Execute("COMMIT");
+            return result;
         }
         catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex, timeout));
+            return Failed(watch, Describe(ex, timeout ?? options?.Timeout, cancellationToken), ErrorCode(ex, cancellationToken));
         }
     }
 
-    public static SqliteQueryResponse DeleteRow(string fullPath, string table, long rowId, TimeSpan? timeout = null)
+    public static SqliteQueryResponse DeleteRow(string fullPath, string table, long rowId, TimeSpan? timeout = null,
+        string? expectedVersion = null, CancellationToken cancellationToken = default, SqliteBrowserOptions? options = null)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            using var database = SqliteGateway.Open(fullPath, timeout);
+            using var database = SqliteGateway.Open(fullPath, timeout, cancellationToken, options);
+            database.Execute("BEGIN IMMEDIATE");
             var name = RequireTable(database, table);
             var alias = RequireRowIdAlias(database, name);
+            CheckVersion(database, name, alias, rowId, expectedVersion);
 
             using (var statement = database.Prepare($"DELETE FROM {Quote(name)} WHERE {alias} = $rowid"))
             {
@@ -378,6 +437,7 @@ internal static class SqliteBrowser
             }
 
             var affected = database.Changes;
+            database.Execute("COMMIT");
 
             return affected == 0
                 ? Failed(watch, "That record is no longer there. Refresh the table.")
@@ -385,7 +445,7 @@ internal static class SqliteBrowser
         }
         catch (Exception ex) when (IsAnswer(ex))
         {
-            return Failed(watch, Describe(ex, timeout));
+            return Failed(watch, Describe(ex, timeout ?? options?.Timeout, cancellationToken), ErrorCode(ex, cancellationToken));
         }
     }
 
@@ -400,9 +460,16 @@ internal static class SqliteBrowser
         statement.Bind("$rowid", rowId);
 
         var columns = Enumerable.Range(0, statement.ColumnCount).Select(statement.ColumnName).ToArray();
-        var rows = statement.Step() ? new[] { ReadRow(statement) } : [];
-
-        return Result(columns, rows, affected, false, watch, null);
+        var row = statement.Step() ? ReadRow(statement) : null;
+        var budget = new ResultBudget();
+        budget.AddColumns(columns);
+        if (row is not null)
+            budget.TryAddRow(row, out _);
+        var result = Result(columns, row is null ? [] : [row.Display], affected, false, watch, null);
+        result.Cells = row is null ? [] : [row.Cells];
+        result.RowId = row is null ? null : rowId.ToString(CultureInfo.InvariantCulture);
+        result.RowVersion = row?.Version;
+        return result;
     }
 
     // ── Reading values ──
@@ -411,28 +478,59 @@ internal static class SqliteBrowser
     /// The first column to read. Non-zero for the editable grid, whose select list carries the rowid
     /// in front of the table's own columns.
     /// </param>
-    private static string?[] ReadRow(SqliteStatement statement, int from = 0)
+    private static RowData ReadRow(SqliteStatement statement, int from = 0)
     {
         var values = new string?[statement.ColumnCount - from];
+        var cells = new SqliteValue[values.Length];
+        if (values.Length > 1024)
+            throw new InvalidOperationException("A browser result cannot have more than 1024 columns.");
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
         for (var i = 0; i < values.Length; i++)
         {
             var ordinal = i + from;
+            var type = statement.ColumnType(ordinal);
+            var name = Encoding.UTF8.GetBytes(statement.ColumnName(ordinal));
+            hash.AppendData(BitConverter.GetBytes(name.Length));
+            hash.AppendData(name);
+            hash.AppendData(BitConverter.GetBytes(type));
+            var bytes = type switch
+            {
+                raw.SQLITE_INTEGER => BitConverter.GetBytes(statement.GetInt64(ordinal)),
+                raw.SQLITE_FLOAT => BitConverter.GetBytes(statement.GetDouble(ordinal)),
+                _ => Array.Empty<byte>()
+            };
+            var data = type is raw.SQLITE_TEXT or raw.SQLITE_BLOB ? statement.GetBlob(ordinal) : bytes.AsSpan();
+            hash.AppendData(BitConverter.GetBytes(data.Length));
+            hash.AppendData(data);
+            var cell = new SqliteValue
+            {
+                Type = type switch
+                {
+                    raw.SQLITE_INTEGER => "integer", raw.SQLITE_FLOAT => "real",
+                    raw.SQLITE_TEXT => "text", raw.SQLITE_BLOB => "blob", _ => "null"
+                },
+                ByteLength = data.Length,
+                Truncated = data.Length > MaxCellBytes
+            };
 
             // Numbers in the invariant culture, and a REAL in its round-trip form. The text is what the
             // grid shows and what an edit sends back: "1,5" from a German phone is TEXT when it returns,
             // and an error in a STRICT table.
-            values[i] = statement.ColumnType(ordinal) switch
+            values[i] = type switch
             {
                 raw.SQLITE_NULL => null,
                 raw.SQLITE_INTEGER => statement.GetInt64(ordinal).ToString(CultureInfo.InvariantCulture),
                 raw.SQLITE_FLOAT => statement.GetDouble(ordinal).ToString("R", CultureInfo.InvariantCulture),
                 raw.SQLITE_BLOB => DescribeBlob(statement.GetBlob(ordinal)),
-                _ => statement.GetString(ordinal)
+                _ => cell.Truncated ? $"TEXT[{data.Length} bytes]" : statement.GetString(ordinal)
             };
+            cell.Value = cell.Truncated ? null : type == raw.SQLITE_BLOB
+                ? Convert.ToBase64String(data) : values[i];
+            cells[i] = cell;
         }
 
-        return values;
+        return new RowData(values, cells, Convert.ToHexString(hash.GetHashAndReset()));
     }
 
     /// <summary>
@@ -452,7 +550,7 @@ internal static class SqliteBrowser
 
     private static List<SqliteColumn> ReadColumns(SqliteDatabase database, string table)
     {
-        using var statement = database.Prepare($"PRAGMA table_info({Quote(table)})");
+        using var statement = database.Prepare($"PRAGMA table_xinfo({Quote(table)})");
         var columns = new List<SqliteColumn>();
 
         while (statement.Step())
@@ -463,7 +561,8 @@ internal static class SqliteBrowser
                 // as a missing value in the header rather than as the answer it is.
                 statement.IsNull(2) || statement.GetString(2).Length == 0 ? "any" : statement.GetString(2),
                 statement.GetBoolean(3),
-                statement.GetInt32(5) > 0
+                statement.GetInt32(5) > 0,
+                statement.GetInt32(6)
             ));
         }
 
@@ -546,7 +645,8 @@ internal static class SqliteBrowser
     {
         var taken = ReadColumns(database, table)
             .Select(x => x.Name)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            .Select(FoldIdentifier)
+            .ToHashSet(StringComparer.Ordinal);
 
         var alias = RowIdAliases.FirstOrDefault(x => !taken.Contains(x));
         if (alias is null)
@@ -617,8 +717,14 @@ internal static class SqliteBrowser
     /// accepted - and would hand back the caller's spelling rather than the table's.
     /// </remarks>
     private static string FindColumn(List<SqliteColumn> columns, string table, string? requested)
-        => columns.FirstOrDefault(x => string.Equals(x.Name, requested, StringComparison.OrdinalIgnoreCase))?.Name
-            ?? throw new InvalidOperationException($"'{table}' has no column called '{requested}'.");
+    {
+        var column = columns.FirstOrDefault(x => FoldIdentifier(x.Name) == FoldIdentifier(requested ?? ""));
+        if (column is null)
+            throw new InvalidOperationException($"'{table}' has no column called '{requested}'.");
+        if (column.Hidden != 0)
+            throw new InvalidOperationException($"Column '{column.Name}' is generated or hidden and cannot be written.");
+        return column.Name;
+    }
 
     // ── Shared shapes ──
 
@@ -633,8 +739,12 @@ internal static class SqliteBrowser
             Error = error
         };
 
-    private static SqliteQueryResponse Failed(Stopwatch watch, string message)
-        => Result([], [], -1, false, watch, message);
+    private static SqliteQueryResponse Failed(Stopwatch watch, string message, string? errorCode = null)
+    {
+        var result = Result([], [], -1, false, watch, message);
+        result.ErrorCode = errorCode;
+        return result;
+    }
 
     /// <summary>
     /// What a request can fail with that is an answer for the person asking: SQL that SQLite refused,
@@ -646,8 +756,154 @@ internal static class SqliteBrowser
     private static string TimedOut(TimeSpan? timeout)
         => $"The statement was still running after {(timeout ?? SqliteGateway.DefaultTimeout).TotalSeconds:0.#} seconds and was stopped.";
 
-    private static string Describe(Exception ex, TimeSpan? timeout)
-        => ex is OperationCanceledException ? TimedOut(timeout) : ex.Message;
+    private static string Describe(Exception ex, TimeSpan? timeout, CancellationToken cancellationToken)
+        => ex is OperationCanceledException
+            ? cancellationToken.IsCancellationRequested ? "The database request was cancelled." : TimedOut(timeout)
+            : ex.Message;
+
+    private static string ErrorCode(Exception ex, CancellationToken cancellationToken)
+        => ex switch
+        {
+            RowConflictException => "conflict",
+            OperationCanceledException => cancellationToken.IsCancellationRequested ? "cancelled" : "timeout",
+            SqliteError sql => $"sqlite_{sql.Code}",
+            _ => "invalid_request"
+        };
+
+    internal static int LimitRows(int requested) => requested <= 0 ? 500 : Math.Min(requested, MaxRows);
+
+    internal static long ParseRowId(string text)
+        => long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var id)
+            && id.ToString(CultureInfo.InvariantCulture) == text
+                ? id : throw new InvalidOperationException("rowId must be a canonical signed 64-bit decimal string.");
+
+    private static string FoldIdentifier(string identifier)
+        => string.Concat(identifier.Select(c => c is >= 'A' and <= 'Z' ? (char)(c + ('a' - 'A')) : c));
+
+    private static void BindEdit(SqliteStatement statement, string parameter, SqliteCellEdit edit)
+    {
+        if (edit.Truncated)
+            throw new InvalidOperationException("A truncated cell cannot be saved. Supply its complete value.");
+        if (edit.Type is null && edit.Value is not null && Encoding.UTF8.GetByteCount(edit.Value) > MaxCellBytes)
+            throw new InvalidOperationException("An edited cell cannot exceed 65536 bytes.");
+        switch (edit.Type)
+        {
+            case null:
+                statement.Bind(parameter, edit.Value);
+                break;
+            case "null" when edit.Value is null:
+                statement.Bind(parameter, (string?)null);
+                break;
+            case "text" when edit.Value is not null:
+                if (Encoding.UTF8.GetByteCount(edit.Value) > MaxCellBytes)
+                    throw new InvalidOperationException("An edited cell cannot exceed 65536 bytes.");
+                statement.Bind(parameter, edit.Value);
+                break;
+            case "integer" when edit.Value is not null:
+                statement.Bind(parameter, ParseRowId(edit.Value));
+                break;
+            case "real" when double.TryParse(edit.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var real)
+                && !double.IsNaN(real):
+                statement.Bind(parameter, real);
+                break;
+            case "blob" when edit.Value is not null:
+                if (edit.Value.Length > ((MaxCellBytes + 2) / 3) * 4)
+                    throw new InvalidOperationException("An edited blob cannot exceed 65536 bytes.");
+                try
+                {
+                    var blob = Convert.FromBase64String(edit.Value);
+                    if (blob.Length > MaxCellBytes)
+                        throw new InvalidOperationException("An edited blob cannot exceed 65536 bytes.");
+                    statement.BindBlob(parameter, blob);
+                }
+                catch (FormatException ex)
+                {
+                    throw new InvalidOperationException("A blob value must be base64.", ex);
+                }
+                break;
+            default:
+                throw new InvalidOperationException("A cell must contain a valid null, integer, real, text or blob value.");
+        }
+    }
+
+    private static void CheckVersion(SqliteDatabase database, string table, string alias, long rowId, string? expectedVersion)
+    {
+        if (expectedVersion is null)
+            return;
+        using var statement = database.Prepare($"SELECT * FROM {Quote(table)} WHERE {alias} = $rowid");
+        statement.Bind("$rowid", rowId);
+        if (!statement.Step() || !string.Equals(ReadRow(statement).Version, expectedVersion, StringComparison.Ordinal))
+            throw new RowConflictException("That record changed since it was read. Refresh the table before saving.");
+    }
+
+    private static int SchemaVersion(SqliteDatabase database)
+    {
+        using var statement = database.Prepare("PRAGMA schema_version");
+        return statement.Step() ? statement.GetInt32(0) : 0;
+    }
+
+    private static string DatabaseKey(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path)));
+
+    private static string EncodeCursor(SqlitePageCursor page)
+    {
+        var cursor = Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(page, StorageAgentJsonContext.Default.SqlitePageCursor));
+        return cursor.Length <= 8192 ? cursor
+            : throw new InvalidOperationException("The table name is too long for a paging cursor.");
+    }
+
+    private static SqlitePageCursor DecodeCursor(string? cursor, string path, string table, int schemaVersion)
+    {
+        if (cursor is null)
+            return new SqlitePageCursor();
+        if (cursor.Length > 8192)
+            throw new InvalidOperationException("Invalid database page cursor.");
+        try
+        {
+            var page = JsonSerializer.Deserialize(Convert.FromBase64String(cursor), StorageAgentJsonContext.Default.SqlitePageCursor);
+            if (page is null || page.Database != DatabaseKey(path) || page.Table != table
+                || page.SchemaVersion != schemaVersion || page.Offset < 0 || page.Offset > long.MaxValue - MaxRows)
+                throw new InvalidOperationException("This page cursor is invalid or the database schema changed. Refresh the table.");
+            return page;
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException)
+        {
+            throw new InvalidOperationException("Invalid database page cursor.", ex);
+        }
+    }
+
+    private sealed record RowData(string?[] Display, SqliteValue[] Cells, string Version);
+
+    private sealed class ResultBudget
+    {
+        // Includes envelope fields, versions, IDs and the bounded continuation cursor.
+        private int _bytes = 16 * 1024;
+        private int _rows;
+
+        public void AddColumns(string[] columns)
+        {
+            _bytes += JsonSerializer.SerializeToUtf8Bytes(columns, StorageAgentJsonContext.Default.StringArray).Length;
+            if (_bytes > MaxResponseBytes)
+                throw new InvalidOperationException("The result's column metadata exceeds the 1 MiB response limit.");
+        }
+
+        public bool TryAddRow(RowData row, out RowData accepted)
+        {
+            accepted = row;
+            var size = JsonSerializer.SerializeToUtf8Bytes(row.Display, StorageAgentJsonContext.Default.StringArray).Length
+                + JsonSerializer.SerializeToUtf8Bytes(row.Cells, StorageAgentJsonContext.Default.SqliteValueArray).Length + 256;
+            if (_bytes + size > MaxResponseBytes)
+            {
+                if (_rows == 0)
+                    throw new InvalidOperationException("One row exceeds the 1 MiB response limit. Select fewer or smaller columns.");
+                return false;
+            }
+            _bytes += size;
+            _rows++;
+            return true;
+        }
+    }
+
+    private sealed class RowConflictException(string message) : InvalidOperationException(message);
 
     /// <summary>
     /// An identifier, quoted. Every name that reaches this came out of <c>sqlite_master</c> or
@@ -656,17 +912,23 @@ internal static class SqliteBrowser
     /// </summary>
     private static string Quote(string identifier) => $"\"{identifier.Replace("\"", "\"\"")}\"";
 
-    private static SqliteColumnDescriptor Describe(SqliteColumn column)
+    private static SqliteColumnDescriptor Describe(SqliteColumn column, bool table)
         => new()
         {
             Name = column.Name,
             Type = column.Type,
             NotNull = column.NotNull,
-            PrimaryKey = column.PrimaryKey
+            PrimaryKey = column.PrimaryKey,
+            IsGenerated = column.Hidden is 2 or 3,
+            IsHidden = column.Hidden == 1,
+            IsWritable = table && column.Hidden == 0
         };
 }
 
 /// <param name="Value">Null is SQL NULL, which is why this is not simply an empty string.</param>
-internal sealed record SqliteCellEdit(string? Column, string? Value);
+internal sealed record SqliteCellEdit(string? Column, string? Value, string? Type = null, bool Truncated = false);
 
-internal sealed record SqliteColumn(string Name, string Type, bool NotNull, bool PrimaryKey);
+internal sealed record SqliteColumn(string Name, string Type, bool NotNull, bool PrimaryKey, int Hidden)
+{
+    public bool IsHidden => Hidden == 1;
+}

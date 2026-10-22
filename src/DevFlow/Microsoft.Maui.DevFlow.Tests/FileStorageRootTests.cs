@@ -335,6 +335,83 @@ public class FileStorageRootTests
         Assert.Equal(payload, await client.DownloadFileBytesAsync("binary/all-bytes.bin"));
     }
 
+    [Theory]
+    [InlineData(".")]
+    [InlineData("./")]
+    [InlineData(".\\.\\")]
+    public async Task DirectoryMutations_RejectPathsThatNormalizeToTheStorageRoot(string path)
+    {
+        var root = CreateTempDirectory();
+        await File.WriteAllTextAsync(Path.Combine(root, "keep.txt"), "keep");
+        using var service = CreateService(("appData", root));
+        using var client = new AgentClient("localhost", service.ServicePort);
+        service.StartServerOnly(new ImmediateDispatcher());
+        await WaitForJsonAsync(client.ListStorageRootsAsync);
+        Assert.False(await client.DeleteDirectoryAsync(path, recursive: true));
+        var create = await client.CreateDirectoryAsync(path);
+        Assert.False(create.GetProperty("success").GetBoolean());
+        var move = await client.MoveAsync(path, "moved");
+        Assert.False(move.GetProperty("success").GetBoolean());
+        Assert.Equal("keep", await File.ReadAllTextAsync(Path.Combine(root, "keep.txt")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StreamTransfer_RoundTripsWithoutClosingCallerStreams(bool nonSeekable)
+    {
+        var root = CreateTempDirectory();
+        using var service = CreateService(("appData", root));
+        using var client = new AgentClient("localhost", service.ServicePort);
+        service.StartServerOnly(new ImmediateDispatcher());
+        await WaitForJsonAsync(client.ListStorageRootsAsync);
+        var bytes = Enumerable.Range(0, 256 * 1024).Select(i => (byte)i).ToArray();
+        using var memory = new MemoryStream(bytes);
+        using Stream input = nonSeekable ? new NonSeekableStream(memory) : memory;
+        var uploaded = await client.UploadFileFromAsync("stream.bin", input);
+        Assert.True(uploaded.Success);
+        Assert.Equal(bytes.Length, uploaded.Size);
+        Assert.True(input.CanRead);
+        using var output = new MemoryStream();
+        await client.DownloadFileToAsync("stream.bin", output);
+        Assert.True(output.CanWrite);
+        Assert.Equal(bytes, output.ToArray());
+        Assert.DoesNotContain(Directory.GetFiles(root), f => Path.GetFileName(f).StartsWith(".devflow-upload-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task LargeDownload_RequiresStreamingInsteadOfBase64Buffering()
+    {
+        var root = CreateTempDirectory();
+        using (var file = File.Create(Path.Combine(root, "large.bin")))
+            file.SetLength(16 * 1024 * 1024 + 1);
+        using var service = CreateService(("appData", root));
+        using var client = new AgentClient("localhost", service.ServicePort);
+        service.StartServerOnly(new ImmediateDispatcher());
+        await WaitForJsonAsync(client.ListStorageRootsAsync);
+        var buffered = await client.DownloadFileAsync("large.bin");
+        Assert.Contains("raw=true", buffered.GetProperty("error").GetString());
+        using var output = new MemoryStream();
+        await client.DownloadFileToAsync("large.bin", output);
+        Assert.Equal(16 * 1024 * 1024 + 1, output.Length);
+    }
+
+    private sealed class NonSeekableStream(Stream source) : Stream
+    {
+        public override bool CanRead => source.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => source.Read(buffer, offset, count);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token)
+            => source.ReadAsync(buffer, offset, count, token);
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private static RootedDevFlowAgentService CreateService(params (string Id, string BasePath)[] roots)
         => CreateService(roots.Select(root => new TestStorageRoot(root.Id, root.BasePath)).ToArray());
 

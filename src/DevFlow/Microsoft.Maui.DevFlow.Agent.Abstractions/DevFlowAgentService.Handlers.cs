@@ -10,6 +10,12 @@ using Microsoft.Maui.DevFlow.Agent.Core.Profiling;
 using Microsoft.Maui.DevFlow.Logging;
 using Microsoft.Maui.DevFlow.Agent.Core.Network;
 
+using Microsoft.Maui.DevFlow.Driver;
+using ProfilerMarker = Microsoft.Maui.DevFlow.Agent.Core.Profiling.ProfilerMarker;
+using ProfilerSample = Microsoft.Maui.DevFlow.Agent.Core.Profiling.ProfilerSample;
+using ProfilerSessionInfo = Microsoft.Maui.DevFlow.Agent.Core.Profiling.ProfilerSessionInfo;
+using ProfilerSpan = Microsoft.Maui.DevFlow.Agent.Core.Profiling.ProfilerSpan;
+
 namespace Microsoft.Maui.DevFlow.Agent.Core;
 
 public partial class DevFlowAgentService
@@ -2549,7 +2555,7 @@ public partial class DevFlowAgentService
         {
             return Task.FromResult(HttpResponse.Json(
                 new StorageRootsResponse { Roots = GetFileStorageRoots().Select(ToFileStorageRootDescriptor).ToArray() },
-                AgentJsonContext.Default.StorageRootsResponse));
+                StorageAgentJsonContext.Default.StorageRootsResponse));
         }
         catch (Exception)
         {
@@ -2605,7 +2611,7 @@ public partial class DevFlowAgentService
             if (!Directory.Exists(resolved.FullPath))
                 return Task.FromResult(HttpResponse.Json(
                     new FileListResponse { Root = root.Id, Path = resolved.RelativePath },
-                    AgentJsonContext.Default.FileListResponse));
+                    StorageAgentJsonContext.Default.FileListResponse));
 
             var entries = new List<FileEntryDescriptor>();
             foreach (var dir in Directory.GetDirectories(resolved.FullPath))
@@ -2639,7 +2645,7 @@ public partial class DevFlowAgentService
                     Path = resolved.RelativePath,
                     Entries = entries.ToArray()
                 },
-                AgentJsonContext.Default.FileListResponse));
+                StorageAgentJsonContext.Default.FileListResponse));
         }
         catch (Exception ex)
         {
@@ -2664,23 +2670,31 @@ public partial class DevFlowAgentService
                 return HttpResponse.NotFound($"File not found: {relativePath}");
 
             var info = new FileInfo(resolved.FullPath);
-            var bytes = await File.ReadAllBytesAsync(resolved.FullPath);
 
-            // raw=true hands the bytes back as-is. The JSON envelope stays the default so existing
-            // callers keep working, but base64 costs a third more on the wire and a copy either side.
             if (IsTruthy(request.QueryParams.GetValueOrDefault("raw")))
-                return HttpResponse.Binary(bytes);
+                return new HttpResponse
+                {
+                    ContentType = "application/octet-stream",
+                    BodyStream = new FileStream(resolved.FullPath, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan)
+                };
+            await using var bufferedSource = new FileStream(resolved.FullPath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.Asynchronous);
+            if (bufferedSource.Length > 16 * 1024 * 1024)
+                return HttpResponse.Error("Base64 downloads are limited to 16 MiB. Use raw=true for streaming.", 413);
+            var bytes = new byte[(int)bufferedSource.Length];
+            await bufferedSource.ReadExactlyAsync(bytes, request.CancellationToken);
 
             return HttpResponse.Json(
                 new FileContentResponse
                 {
                     Root = root.Id,
                     Path = resolved.RelativePath,
-                    Size = info.Length,
+                    Size = bytes.Length,
                     LastModified = info.LastWriteTimeUtc.ToString("O"),
                     ContentBase64 = Convert.ToBase64String(bytes)
                 },
-                AgentJsonContext.Default.FileContentResponse);
+                StorageAgentJsonContext.Default.FileContentResponse);
         }
         catch (InvalidOperationException ex)
         {
@@ -2703,11 +2717,11 @@ public partial class DevFlowAgentService
             var resolved = FileStoragePathResolver.Resolve(root.BasePath, relativePath);
             FileStoragePathResolver.EnsureNoReparsePointTraversal(resolved.BasePath, resolved.FullPath, includeTarget: true);
 
-            byte[] bytes;
+            byte[]? bytes = null;
             if (IsJsonContentType(request.ContentType))
             {
-                var body = request.BodyAs(AgentJsonContext.Default.FileUploadRequest);
-                if (body == null || string.IsNullOrEmpty(body.ContentBase64))
+                var body = request.BodyAs(StorageAgentJsonContext.Default.FileUploadRequest);
+                if (body?.ContentBase64 is null)
                     return HttpResponse.Error("Request body must include 'contentBase64'");
 
                 try
@@ -2722,7 +2736,8 @@ public partial class DevFlowAgentService
             else
             {
                 // Anything that is not JSON is taken as the file itself.
-                bytes = request.BodyBytes ?? Array.Empty<byte>();
+                if (request.BodyStream is null)
+                    bytes = request.BodyBytes ?? Array.Empty<byte>();
             }
 
             var dir = Path.GetDirectoryName(resolved.FullPath);
@@ -2731,7 +2746,27 @@ public partial class DevFlowAgentService
 
             FileStoragePathResolver.EnsureNoReparsePointTraversal(resolved.BasePath, resolved.FullPath, includeTarget: true);
 
-            await File.WriteAllBytesAsync(resolved.FullPath, bytes);
+            var temporaryPath = Path.Combine(dir!, $".devflow-upload-{Guid.NewGuid():N}");
+            try
+            {
+                await using (var destination = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
+                    FileShare.None, 64 * 1024, FileOptions.Asynchronous))
+                {
+                    if (request.BodyStream is { } source)
+                        await source.CopyToAsync(destination, request.CancellationToken);
+                    else
+                        await destination.WriteAsync(bytes!, request.CancellationToken);
+                    await destination.FlushAsync(request.CancellationToken);
+                }
+                request.CancellationToken.ThrowIfCancellationRequested();
+                FileStoragePathResolver.EnsureNoReparsePointTraversal(resolved.BasePath, resolved.FullPath, includeTarget: true);
+                File.Move(temporaryPath, resolved.FullPath, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                    File.Delete(temporaryPath);
+            }
             var info = new FileInfo(resolved.FullPath);
 
             return HttpResponse.Json(
@@ -2743,7 +2778,7 @@ public partial class DevFlowAgentService
                     Size = info.Length,
                     LastModified = info.LastWriteTimeUtc.ToString("O")
                 },
-                AgentJsonContext.Default.FileWriteResponse);
+                StorageAgentJsonContext.Default.FileWriteResponse);
         }
         catch (InvalidOperationException ex)
         {
@@ -2778,7 +2813,7 @@ public partial class DevFlowAgentService
                     Path = resolved.RelativePath,
                     Message = $"File deleted: {resolved.RelativePath}"
                 },
-                AgentJsonContext.Default.FileRemovedResponse));
+                StorageAgentJsonContext.Default.FileRemovedResponse));
         }
         catch (InvalidOperationException ex)
         {
@@ -2817,7 +2852,7 @@ public partial class DevFlowAgentService
                     Path = resolved.RelativePath,
                     Created = !existed
                 },
-                AgentJsonContext.Default.DirectoryCreatedResponse));
+                StorageAgentJsonContext.Default.DirectoryCreatedResponse));
         }
         catch (InvalidOperationException ex)
         {
@@ -2859,7 +2894,7 @@ public partial class DevFlowAgentService
                     Path = resolved.RelativePath,
                     Message = $"Directory deleted: {resolved.RelativePath}"
                 },
-                AgentJsonContext.Default.FileRemovedResponse));
+                StorageAgentJsonContext.Default.FileRemovedResponse));
         }
         catch (InvalidOperationException ex)
         {
@@ -2881,7 +2916,7 @@ public partial class DevFlowAgentService
         {
             var root = ResolveFileStorageRoot(request, FileStorageOperationMove);
 
-            var body = request.BodyAs(AgentJsonContext.Default.FileMoveRequest);
+            var body = request.BodyAs(StorageAgentJsonContext.Default.FileMoveRequest);
             if (body == null || string.IsNullOrWhiteSpace(body.From) || string.IsNullOrWhiteSpace(body.To))
                 return Task.FromResult(HttpResponse.Error("Request body must include 'from' and 'to'"));
 
@@ -2928,7 +2963,7 @@ public partial class DevFlowAgentService
                     Path = to.RelativePath,
                     Type = isDirectory ? "directory" : "file"
                 },
-                AgentJsonContext.Default.FileMovedResponse));
+                StorageAgentJsonContext.Default.FileMovedResponse));
         }
         catch (InvalidOperationException ex)
         {

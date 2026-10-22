@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Maui.DevFlow.Agent.Core;
 
 namespace Microsoft.Maui.DevFlow.Tests;
@@ -12,7 +14,7 @@ namespace Microsoft.Maui.DevFlow.Tests;
 /// .NET's own JsonContent sends chunked, and a file upload sends bytes that a UTF-8 round trip
 /// would corrupt.
 /// </summary>
-public class AgentHttpServerBodyTests
+public partial class AgentHttpServerBodyTests
 {
     [Fact]
     public async Task ChunkedRequestBody_IsReassembledBeforeTheHandlerSeesIt()
@@ -28,7 +30,8 @@ public class AgentHttpServerBodyTests
 
         // JsonContent cannot compute its length, so HttpClient frames this as chunked.
         using var http = new HttpClient { BaseAddress = new Uri($"http://localhost:{server.Port}") };
-        var response = await SendWithRetryAsync(() => http.PostAsJsonAsync("/echo", new EchoPayload("hello", 42)));
+        var response = await SendWithRetryAsync(() => http.PostAsJsonAsync("/echo", new EchoPayload("hello", 42),
+            EchoJsonContext.Default.EchoPayload));
 
         Assert.True(response.IsSuccessStatusCode);
         Assert.NotNull(seen);
@@ -198,6 +201,73 @@ public class AgentHttpServerBodyTests
     }
 
     private sealed record EchoPayload(string Name, int Count);
+
+    [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+    [JsonSerializable(typeof(EchoPayload))]
+    private sealed partial class EchoJsonContext : JsonSerializerContext;
+
+    [Fact]
+    public async Task ContentLengthBody_RejectsPrematureEndOfStreamBeforeRouting()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var sender = new TcpClient();
+        await sender.ConnectAsync((IPEndPoint)listener.LocalEndpoint);
+        using var receiver = await listener.AcceptTcpClientAsync();
+        var sendStream = sender.GetStream();
+        await WriteAsciiAsync(sendStream,
+            "PUT /api/v1/storage/files/keep.bin HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\nabc");
+        sender.Client.Shutdown(SocketShutdown.Send);
+        using var server = new AgentHttpServer();
+        var reader = typeof(AgentHttpServer).GetMethod("ReadRequestAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var request = await ((Task<HttpRequest?>)reader.Invoke(server, [receiver.GetStream(), CancellationToken.None])!)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Null(request);
+    }
+
+    [Fact]
+    public async Task RawUpload_BuffersOnDiskRatherThanInManagedMemory()
+    {
+        using var server = new AgentHttpServer(GetFreePort());
+        byte[]? seen = null;
+        Stream? owned = null;
+        server.MapPut("/api/v1/storage/files/raw.bin", async request =>
+        {
+            Assert.Null(request.BodyBytes);
+            Assert.IsType<FileStream>(request.BodyStream);
+            owned = request.BodyStream;
+            using var content = new MemoryStream();
+            await request.BodyStream!.CopyToAsync(content);
+            seen = content.ToArray();
+            return HttpResponse.Ok();
+        }, requiresMutationLease: false);
+        server.Start();
+        using var http = new HttpClient();
+        var bytes = Enumerable.Range(0, 100000).Select(i => (byte)i).ToArray();
+        using var body = new ByteArrayContent(bytes);
+        body.Headers.ContentType = new("application/octet-stream");
+        using var response = await http.PutAsync($"http://localhost:{server.Port}/api/v1/storage/files/raw.bin", body);
+        Assert.True(response.IsSuccessStatusCode);
+        Assert.Equal(bytes, seen);
+        for (var i = 0; i < 50 && owned!.CanRead; i++)
+            await Task.Delay(10);
+        Assert.False(owned!.CanRead);
+    }
+
+    [Fact]
+    public async Task ChunkedRequest_RejectsIncompleteLastChunk()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var sender = new TcpClient();
+        await sender.ConnectAsync((IPEndPoint)listener.LocalEndpoint);
+        using var receiver = await listener.AcceptTcpClientAsync();
+        await WriteAsciiAsync(sender.GetStream(), "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\n0\r\n");
+        sender.Client.Shutdown(SocketShutdown.Send);
+        using var server = new AgentHttpServer();
+        var reader = typeof(AgentHttpServer).GetMethod("ReadRequestAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        Assert.Null(await (Task<HttpRequest?>)reader.Invoke(server, [receiver.GetStream(), CancellationToken.None])!);
+    }
 
     private static async Task<HttpResponseMessage> SendWithRetryAsync(Func<Task<HttpResponseMessage>> send)
     {

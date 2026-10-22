@@ -29,12 +29,14 @@ public class BackgroundJobPlatformTests
         }
     }
 
-    [Fact]
-    public async Task IosRun_HandlerReschedulesImmediately_AcknowledgesLaunchWithoutClaimingExecution()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task IosRun_DebugAcknowledgesLaunch_ReleaseDoesNotSchedule(bool debug)
     {
         // Compile the actual platform method against a scheduler that immediately reschedules
         // from its handler, so this regression runs without physical iOS hardware.
-        var method = Parse(AgentPath, debug: true).GetRoot().DescendantNodes()
+        var method = Parse(AgentPath, debug).GetRoot().DescendantNodes()
             .OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.ValueText == "RunPlatformJobAsync");
         var statements = string.Join("\n", method.Body!.Statements.Select(s => s.WithoutTrivia().ToFullString()));
         var source = $$"""
@@ -78,8 +80,9 @@ public class BackgroundJobPlatformTests
             public class BGAppRefreshTaskRequest(string id) : BGTaskRequest { }
             public class BGTaskScheduler
             {
+                public static int Submissions;
                 public static BGTaskScheduler Shared = new();
-                public void Submit(BGTaskRequest request, out NSError? error) { error = null; }
+                public void Submit(BGTaskRequest request, out NSError? error) { Submissions++; error = null; }
             }
             """;
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
@@ -91,10 +94,19 @@ public class BackgroundJobPlatformTests
         var emitted = compilation.Emit(assemblyStream);
         Assert.True(emitted.Success, string.Join("\n", emitted.Diagnostics));
 
-        var type = Assembly.Load(assemblyStream.ToArray()).GetType("Probe")!;
+        var assembly = Assembly.Load(assemblyStream.ToArray());
+        var type = assembly.GetType("Probe")!;
         var probe = Activator.CreateInstance(type)!;
-        var result = Assert.IsType<Dictionary<string, object?>>(
-            await (Task<object?>)type.GetMethod("Run")!.Invoke(probe, null)!);
+        var value = await (Task<object?>)type.GetMethod("Run")!.Invoke(probe, null)!;
+        Assert.Equal(0, assembly.GetType("BGTaskScheduler")!.GetField("Submissions")!.GetValue(null));
+        if (!debug)
+        {
+            Assert.Null(value);
+            Assert.Equal(0, type.GetField("PendingReads")!.GetValue(null));
+            Assert.Equal(0, type.GetField("Executions")!.GetValue(null));
+            return;
+        }
+        var result = Assert.IsType<Dictionary<string, object?>>(value);
         Assert.Equal(true, result["success"]);
         Assert.Equal(true, result["launchRequested"]);
         Assert.Equal(false, result["executionVerified"]);

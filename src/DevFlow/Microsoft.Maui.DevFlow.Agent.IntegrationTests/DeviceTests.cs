@@ -186,11 +186,17 @@ public class DeviceTests : IntegrationTestBase
         Assert.Contains(sampleJob.GetProperty("state").GetString(),
             new[] { "ENQUEUED", "RUNNING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED" });
 
-        var mappings = json.GetProperty("scheduledJobs").EnumerateArray();
-        var mapping = Assert.Single(mappings, m =>
-            m.GetProperty("workSpecId").GetString() == sampleJob.GetProperty("identifier").GetString());
-        Assert.True(int.TryParse(mapping.GetProperty("jobId").GetString(), out _));
-        Assert.True(mapping.GetProperty("namespace").ValueKind is JsonValueKind.String or JsonValueKind.Null);
+        var mappings = json.GetProperty("scheduledJobs").EnumerateArray().Where(m =>
+            m.GetProperty("workSpecId").GetString() == sampleJob.GetProperty("identifier").GetString()).ToArray();
+        Assert.NotEmpty(mappings);
+        Assert.All(mappings, mapping =>
+        {
+            Assert.True(int.TryParse(mapping.GetProperty("jobId").GetString(), out _));
+            Assert.Equal(sampleJob.GetProperty("generation").GetInt32(), mapping.GetProperty("generation").GetInt32());
+            Assert.True(mapping.GetProperty("namespace").ValueKind is JsonValueKind.String or JsonValueKind.Null);
+        });
+        Assert.True(Guid.TryParse(json.GetProperty("agentInstanceId").GetString(), out _));
+        Assert.InRange(json.GetProperty("agentPort").GetInt32(), 1, 65535);
     }
 
     [Fact]

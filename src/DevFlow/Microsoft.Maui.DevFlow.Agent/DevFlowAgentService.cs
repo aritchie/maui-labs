@@ -476,6 +476,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
     }
 
 #if ANDROID
+    private readonly string _jobsAgentInstanceId = Guid.NewGuid().ToString("N");
     /// <summary>
     /// Whether androidx.work is actually on the app's classpath. WorkManager is an opt-in
     /// AndroidX dependency, not part of the platform, so an app that never referenced it has
@@ -574,6 +575,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 jobs.Add(new Dictionary<string, object?>
                 {
                     ["workSpecId"] = workSpecId,
+                    ["generation"] = job.Extras!.GetInt("EXTRA_WORK_SPEC_GENERATION", 0),
                     ["jobId"] = job.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     ["namespace"] = jobNamespace
                 });
@@ -616,7 +618,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
         {
 #if IOS || MACCATALYST
             // Triggering a BGTask needs a private selector that is compiled out of Release
-            // builds (see TrySimulateBgTaskLaunch), so a Release agent can list and schedule
+            // builds (see TrySimulateBgTaskLaunch), so a Release agent can list
             // but never run. Advertising "run" there would hand callers a feature-detect that
             // is guaranteed to fail.
             return BgTaskRunSupported;
@@ -744,12 +746,17 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 var runAttemptCount = 0;
                 var countValue = infoClass.GetMethod("getRunAttemptCount")?.Invoke(infoObj)?.ToString();
                 if (countValue != null) int.TryParse(countValue, out runAttemptCount);
+                var generationMethod = infoClass.GetMethods().FirstOrDefault(method =>
+                    method.Name == "getGeneration" && method.GetParameterTypes().Length == 0);
+                var generation = generationMethod is null ? 0 : int.Parse(
+                    generationMethod.Invoke(infoObj)!.ToString()!, System.Globalization.CultureInfo.InvariantCulture);
 
                 jobs.Add(new Dictionary<string, object?>
                 {
                     ["identifier"] = identifier,
                     ["tags"] = tags.ToArray(),
                     ["state"] = state,
+                    ["generation"] = generation,
                     ["runAttemptCount"] = runAttemptCount
                 });
             }
@@ -760,6 +767,8 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 ["type"] = "WorkManager",
                 ["supported"] = true,
                 ["runSupported"] = false,
+                ["agentInstanceId"] = _jobsAgentInstanceId,
+                ["agentPort"] = Port,
                 ["jobs"] = jobs,
                 ["scheduledJobs"] = GetScheduledWorkManagerJobs()
             };
@@ -811,6 +820,9 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
                 : WorkManagerMissingReason
         });
 #elif IOS || MACCATALYST
+#if !DEBUG
+        return await base.RunPlatformJobAsync(identifier, type);
+#else
         try
         {
             var taskType = await ResolveBgTaskRequestTypeAsync(identifier, type);
@@ -876,6 +888,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
         {
             return new Dictionary<string, object?> { ["success"] = false, ["error"] = ex.Message, ["identifier"] = identifier };
         }
+#endif
 #else
         return await base.RunPlatformJobAsync(identifier, type);
 #endif
@@ -937,7 +950,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
     /// <para>
     /// <b>Debug builds only.</b> This is a private selector, and the agent compiles into the host
     /// app; shipping it would expose consumers to App Store review rejection. There is no public
-    /// API that runs a BGTask on demand, so release builds can schedule but not trigger.
+    /// API that runs a BGTask on demand; release trigger requests are rejected before scheduling.
     /// </para>
     /// </summary>
     private static bool TrySimulateBgTaskLaunch(string identifier, out string? error)
@@ -966,7 +979,7 @@ public partial class PlatformAgentService : MauiDevFlowAgentService
         }
 #else
         error = "Triggering a BGTask requires a private API and is only available in Debug builds of the DevFlow agent. " +
-                "The request has been scheduled; iOS will launch it at its own discretion.";
+                "No task was scheduled.";
         return false;
 #endif
     }

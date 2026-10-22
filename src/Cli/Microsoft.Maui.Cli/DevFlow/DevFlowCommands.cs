@@ -879,7 +879,7 @@ public class DevFlowCommands
         var jobRunTypeOption = new Option<string?>("--type") { Description = "iOS BGTask type: processing or refresh" };
         var jobRunSerialOption = new Option<string?>("--serial") { Description = "Android device/emulator serial (adb -s)" };
         var jobRunPackageOption = new Option<string?>("--package") { Description = "Android package name (auto-detected from the agent if omitted)" };
-        var jobRunTimeoutOption = new Option<int>("--timeout") { Description = "Android: seconds to wait for one-time work to reach a terminal state", DefaultValueFactory = _ => 30 };
+        var jobRunTimeoutOption = new Option<int>("--timeout") { Description = "Android: overall timeout in seconds for target verification, triggering, and observing one-time work", DefaultValueFactory = _ => 30 };
         jobRunTimeoutOption.Validators.Add(result =>
         {
             if (result.GetValueOrDefault<int>() <= 0)
@@ -900,7 +900,7 @@ public class DevFlowCommands
                 ctx.GetValue(jobRunTypeOption),
                 ctx.GetValue(jobRunSerialOption),
                 ctx.GetValue(jobRunPackageOption),
-                ctx.GetValue(jobRunTimeoutOption));
+                ctx.GetValue(jobRunTimeoutOption), ct);
             return succeeded ? 0 : 1;
         });
         jobsCommand.Add(jobsRunCmd);
@@ -3427,7 +3427,6 @@ public class DevFlowCommands
         catch (Exception ex) { Output.WriteError(ex.Message, json); _errorOccurred = true; }
     }
 
-    private static readonly string[] TerminalJobStates = ["SUCCEEDED", "FAILED", "CANCELLED"];
     internal static Func<AndroidAppDriver> JobDriverFactory { get; set; } = () => new AndroidAppDriver();
 
     private static async Task MauiJobsListAsync(string host, int port, bool json)
@@ -3575,7 +3574,7 @@ public class DevFlowCommands
 
     private static async Task<bool> MauiJobsRunAsync(
         string host, int port, bool json, string identifier,
-        string? type, string? serial, string? package, int timeoutSeconds)
+        string? type, string? serial, string? package, int timeoutSeconds, CancellationToken cancellationToken)
     {
         try
         {
@@ -3584,7 +3583,7 @@ public class DevFlowCommands
             var platform = jobs.TryGetProperty("platform", out var p) ? p.GetString() ?? "" : "";
 
             if (platform.Equals("Android", StringComparison.OrdinalIgnoreCase))
-                return await RunAndroidJobAsync(client, json, identifier, serial, package, timeoutSeconds);
+                return await RunAndroidJobAsync(client, json, identifier, serial, package, timeoutSeconds, cancellationToken);
 
             // iOS / Mac Catalyst: the agent schedules the request and forces the launch in-process.
             var result = await client.RunJobAsync(identifier, type);
@@ -3608,155 +3607,47 @@ public class DevFlowCommands
         catch (Exception ex) { Output.WriteError(ex.Message, json); _errorOccurred = true; return false; }
     }
 
-    /// <summary>
-    /// Android jobs cannot be forced from inside the app — the original WorkRequest cannot be
-    /// reconstructed from a WorkInfo. adb can force them through JobScheduler, so this triggers
-    /// host-side and then reads the outcome back from the in-app WorkManager query, which is the
-    /// only place the real SUCCEEDED/FAILED result lives.
-    /// </summary>
     private static async Task<bool> RunAndroidJobAsync(
         Microsoft.Maui.DevFlow.Driver.AgentClient client, bool json,
-        string identifier, string? serial, string? package, int timeoutSeconds)
+        string identifier, string? serial, string? package, int timeoutSeconds, CancellationToken cancellationToken)
     {
-        var status = await client.GetStatusAsync();
-        var agentPackage = status?.App?.PackageId;
-        if (!string.IsNullOrWhiteSpace(package) && !string.IsNullOrWhiteSpace(agentPackage)
-            && !string.Equals(package, agentPackage, StringComparison.Ordinal))
-            throw new InvalidOperationException("--package must match the app connected to the agent.");
-        package ??= agentPackage;
-
-        if (string.IsNullOrWhiteSpace(package))
-        {
-            Output.WriteError("Could not determine the Android package name; pass --package.", json);
-            _errorOccurred = true;
-            return false;
-        }
-
         using var driver = JobDriverFactory();
         driver.Serial = serial;
-        var scheduled = await driver.ListScheduledJobsAsync(package);
-        var jobs = await client.GetJobsAsync();
-        var (target, workSpecId) = ResolveAndroidJob(jobs, scheduled, identifier);
-        var (before, _) = await ReadWorkStateAsync(client, workSpecId);
-        if (!string.Equals(before, "ENQUEUED", StringComparison.Ordinal))
-            throw new InvalidOperationException($"Work '{workSpecId}' is {before}; only enqueued work can be forced.");
-        var runOutput = await driver.RunScheduledJobAsync(package, target.JobId, target.Namespace);
-
-        // Poll the in-app WorkManager view until the work reaches a terminal state.
-        string? state = null;
-        var attemptCount = 0;
-        var deadline = DateTime.UtcNow.AddSeconds(Math.Max(1, timeoutSeconds));
-        while (DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(750);
-            var (s, count) = await ReadWorkStateAsync(client, workSpecId);
-            state = s;
-            attemptCount = count;
-            if (TerminalJobStates.Contains(state, StringComparer.OrdinalIgnoreCase)) break;
-        }
-
-        var timedOut = state == null || !TerminalJobStates.Contains(state, StringComparer.OrdinalIgnoreCase);
-        var succeeded = string.Equals(state, "SUCCEEDED", StringComparison.OrdinalIgnoreCase);
+        var result = await new Jobs.AndroidJobRunner(client, driver).RunAsync(
+            identifier, package, TimeSpan.FromSeconds(timeoutSeconds), cancellationToken);
+        var target = result.Target.Job;
 
         if (json)
         {
             Output.WriteRawJson(CliJson.SerializeUntyped(new JsonObject
             {
-                ["success"] = succeeded,
-                ["identifier"] = workSpecId,
+                ["success"] = result.Success,
+                ["identifier"] = result.Target.WorkSpecId,
+                ["generation"] = result.Target.Generation,
                 ["requestedIdentifier"] = identifier,
                 ["jobId"] = target.JobId,
                 ["worker"] = target.Worker,
                 ["namespace"] = target.Namespace,
-                ["stateBefore"] = before,
-                ["state"] = state,
-                ["timedOut"] = timedOut,
-                ["error"] = timedOut ? $"No terminal state reported within {timeoutSeconds}s." : null,
-                ["runAttemptCount"] = attemptCount,
+                ["stateBefore"] = result.StateBefore,
+                ["state"] = result.State,
+                ["timedOut"] = result.TimedOut,
+                ["error"] = result.TimedOut ? $"No terminal state reported within {timeoutSeconds}s." : null,
+                ["runAttemptCount"] = result.Attempts,
                 ["triggeredVia"] = "adb cmd jobscheduler run -f",
-                ["adbOutput"] = runOutput
+                ["adbOutput"] = result.AdbOutput
             }, indented: false));
         }
         else
         {
-            Console.WriteLine($"Forced job {target.JobId} ({target.Worker ?? identifier}) via adb — {runOutput}");
-            if (timedOut)
-                Console.WriteLine($"FAILED: no terminal state reported within {timeoutSeconds}s (state: {state ?? before})");
+            Console.WriteLine($"Forced job {target.JobId} ({target.Worker ?? identifier}) via adb — {result.AdbOutput}");
+            if (result.TimedOut)
+                Console.WriteLine($"FAILED: no terminal state reported within {timeoutSeconds}s (state: {result.State})");
             else
-                Console.WriteLine($"{(succeeded ? "SUCCESS" : "FAILED")}: {state} after {attemptCount} attempt(s)");
+                Console.WriteLine($"{(result.Success ? "SUCCESS" : "FAILED")}: {result.State} after {result.Attempts} attempt(s)");
         }
 
-        if (!succeeded) _errorOccurred = true;
-        return succeeded;
-    }
-
-    internal static async Task<(string State, int Attempts)> ReadWorkStateAsync(
-        Microsoft.Maui.DevFlow.Driver.AgentClient client, string workSpecId)
-    {
-        var jobs = await client.GetJobsAsync();
-        foreach (var job in GetWorkInfos(jobs).EnumerateArray())
-        {
-            if (!string.Equals(job.GetProperty("identifier").GetString(), workSpecId, StringComparison.OrdinalIgnoreCase))
-                continue;
-            var state = job.GetProperty("state").GetString()
-                ?? throw new InvalidOperationException($"Work '{workSpecId}' has no state.");
-            return (state, job.GetProperty("runAttemptCount").GetInt32());
-        }
-        throw new InvalidOperationException($"Work '{workSpecId}' disappeared from the agent listing; its outcome cannot be verified.");
-    }
-
-    internal static (AndroidScheduledJob Job, string WorkSpecId) ResolveAndroidJob(
-        JsonElement jobs, IReadOnlyList<AndroidScheduledJob> scheduled, string identifier)
-    {
-        var workInfos = GetWorkInfos(jobs).EnumerateArray().ToList();
-        if (!jobs.TryGetProperty("scheduledJobs", out var mappings) || mappings.ValueKind != JsonValueKind.Array)
-            throw new InvalidOperationException("The agent does not provide exact JobScheduler mappings. Update the agent before running work.");
-
-        var explicitUuid = Guid.TryParse(identifier, out var uuid);
-        var numericJobId = int.TryParse(identifier, out _);
-        var candidates = new List<(AndroidScheduledJob Job, string WorkSpecId)>();
-        foreach (var mapping in mappings.EnumerateArray())
-        {
-            var workSpecId = mapping.GetProperty("workSpecId").GetString()
-                ?? throw new InvalidOperationException("JobScheduler mapping has no WorkSpec UUID.");
-            var jobId = mapping.GetProperty("jobId").GetString();
-            var jobNamespace = mapping.GetProperty("namespace").GetString();
-            var info = workInfos.FirstOrDefault(w =>
-                string.Equals(w.GetProperty("identifier").GetString(), workSpecId, StringComparison.OrdinalIgnoreCase));
-            if (info.ValueKind != JsonValueKind.Object) continue;
-
-            var matches = explicitUuid
-                ? Guid.TryParse(workSpecId, out var mappedUuid) && mappedUuid == uuid
-                : numericJobId
-                    ? jobId == identifier
-                    : info.GetProperty("tags").EnumerateArray().Any(t =>
-                        t.GetString() is string tag &&
-                        (tag == identifier || tag.EndsWith("." + identifier, StringComparison.Ordinal)));
-            if (!matches) continue;
-
-            foreach (var job in scheduled.Where(j => j.IsWorkManager && j.JobId == jobId && j.Namespace == jobNamespace))
-            {
-                candidates.Add((job, workSpecId));
-            }
-        }
-
-        if (candidates.Count == 0)
-            throw new InvalidOperationException($"No scheduled WorkManager job matched '{identifier}' by exact WorkSpec mapping.");
-        if (candidates.Count != 1)
-            throw new InvalidOperationException($"'{identifier}' is ambiguous: {candidates.Count} scheduled jobs match. Use a unique WorkSpec UUID.");
-        return candidates[0];
-    }
-
-    private static JsonElement GetWorkInfos(JsonElement result)
-    {
-        if (result.TryGetProperty("error", out var error))
-            throw new InvalidOperationException($"WorkManager query failed: {error.GetString()}");
-        if (!result.TryGetProperty("supported", out var supported) || !supported.GetBoolean())
-            throw new InvalidOperationException(result.TryGetProperty("reason", out var reason)
-                ? reason.GetString() : "WorkManager inspection is unsupported.");
-        if (!result.TryGetProperty("jobs", out var jobs) || jobs.ValueKind != JsonValueKind.Array)
-            throw new InvalidOperationException("WorkManager query returned no job collection.");
-        return jobs;
+        if (!result.Success) _errorOccurred = true;
+        return result.Success;
     }
 
     private static async Task MauiFocusAsync(string host, int port, bool json, ElementInfo element)

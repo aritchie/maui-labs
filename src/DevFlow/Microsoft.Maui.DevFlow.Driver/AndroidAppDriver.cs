@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using System.Xml.Linq;
 using Xamarin.Android.Tools;
 
@@ -506,10 +507,38 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// identifier is a numeric job id rather than a WorkSpec UUID.
     /// </para>
     /// </summary>
-    public virtual async Task<IReadOnlyList<AndroidScheduledJob>> ListScheduledJobsAsync(string packageName)
+    public virtual async Task<IReadOnlyList<AndroidScheduledJob>> ListScheduledJobsAsync(string packageName, CancellationToken cancellationToken = default)
     {
-        var dump = await RunAdbWithOutputAsync("shell", "dumpsys", "jobscheduler");
+        var dump = await RunJobAdbAsync(["shell", "dumpsys", "jobscheduler"], cancellationToken);
         return ParseScheduledJobs(dump, packageName);
+    }
+
+    /// <summary>
+    /// Reads jobs through a temporary forward on the selected adb device, pinning its serial
+    /// for subsequent scheduler commands. Callers must compare the agent instance identity.
+    /// </summary>
+    public virtual async Task<JsonElement> ReadJobsOnDeviceAsync(int agentPort, CancellationToken cancellationToken = default)
+    {
+        if (agentPort is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(agentPort));
+        Serial = await ResolveSerialAsync().WaitAsync(cancellationToken);
+        var localPortText = await RunJobAdbAsync(
+            ["forward", "tcp:0", $"tcp:{agentPort}"], cancellationToken);
+        if (!int.TryParse(localPortText.Trim(), out var localPort) || localPort is < 1 or > 65535)
+            throw new InvalidOperationException($"adb did not return an allocated forward port: {localPortText}");
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            using var response = await http.GetAsync(
+                $"http://127.0.0.1:{localPort}/api/v1/device/jobs", cancellationToken);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+            return document.RootElement.Clone();
+        }
+        finally
+        {
+            await RunJobAdbAsync(["forward", "--remove", $"tcp:{localPort}"], CancellationToken.None);
+        }
     }
 
     /// <summary>
@@ -594,9 +623,9 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     /// Ignore unmet constraints. Required for anything with a delay or a network/charging
     /// requirement, which is most real work; without it JobScheduler declines.
     /// </param>
-    public virtual async Task<string> RunScheduledJobAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace, bool force = true)
+    public virtual async Task<string> RunScheduledJobAsync(string packageName, string jobId, string? jobNamespace = WorkManagerNamespace, bool force = true, CancellationToken cancellationToken = default)
     {
-        var output = await RunAdbWithOutputAsync(BuildJobSchedulerArguments("run", packageName, jobId, jobNamespace, force));
+        var output = await RunJobAdbAsync(BuildJobSchedulerArguments("run", packageName, jobId, jobNamespace, force), cancellationToken);
         return output.Trim();
     }
 
@@ -618,6 +647,13 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
             arguments.AddRange(["-n", jobNamespace]);
         arguments.AddRange([packageName, jobId]);
         return arguments.ToArray();
+    }
+
+    private async Task<string> RunJobAdbAsync(string[] arguments, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(15));
+        return await RunAdbForSerialAsync(Serial, arguments, timeout.Token);
     }
 
     // ──────────────────────────────────────────────
@@ -663,7 +699,7 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
     private Task<string> RunAdbWithOutputAsync(params string[] arguments)
         => RunAdbForSerialAsync(Serial, arguments);
 
-    private async Task<string> RunAdbForSerialAsync(string? serial, string[] arguments)
+    private async Task<string> RunAdbForSerialAsync(string? serial, string[] arguments, CancellationToken cancellationToken = default)
     {
         var adbArguments = BuildAdbArguments(serial, arguments);
         var processStartInfo = CreateAdbProcessStartInfo(AdbPath, adbArguments);
@@ -674,7 +710,7 @@ public class AndroidAppDriver : AppDriverBase, IAlertDriver
             processStartInfo,
             output,
             error,
-            CancellationToken.None).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
 
         if (exitCode != 0)
             throw new InvalidOperationException($"adb {string.Join(" ", arguments)} failed: {error}");

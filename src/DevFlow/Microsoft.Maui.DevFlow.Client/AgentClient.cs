@@ -86,9 +86,14 @@ public class AgentClient : IDisposable
     public TimeSpan TransientFailureRetryDelay { get; set; } = TimeSpan.FromMilliseconds(250);
 
     public AgentClient(string host = "localhost", int port = 9223)
+        : this(host, port, CreateTransportHandler(host))
+    {
+    }
+
+    internal AgentClient(string host, int port, HttpMessageHandler transportHandler)
     {
         _baseUrl = $"http://{host}:{port}";
-        _http = CreateHttpClient(host, GetCurrentMutationLease);
+        _http = CreateHttpClient(transportHandler, GetCurrentMutationLease);
     }
 
     /// <summary>
@@ -293,8 +298,19 @@ public class AgentClient : IDisposable
             throw new MutationLeaseException(status);
     }
 
+    private static HttpClient CreateHttpClient(
+        HttpMessageHandler transportHandler,
+        Func<MutationLeaseIdentity?> mutationLeaseProvider)
+    {
+        var leaseHandler = new MutationLeaseHeaderHandler(mutationLeaseProvider)
+        {
+            InnerHandler = transportHandler
+        };
+        return new HttpClient(leaseHandler) { Timeout = TimeSpan.FromSeconds(30) };
+    }
+
     /// <summary>
-    /// Builds the underlying <see cref="HttpClient"/>. When <paramref name="host"/> is the
+    /// Builds the underlying HTTP transport. When <paramref name="host"/> is the
     /// <c>localhost</c> alias, the IPv4 (<c>127.0.0.1</c>) loopback used by the built-in agent is
     /// preferred, with IPv6 (<c>::1</c>) kept as a fallback.
     /// </summary>
@@ -313,17 +329,6 @@ public class AgentClient : IDisposable
     /// between the two.
     /// </para>
     /// </remarks>
-    private static HttpClient CreateHttpClient(
-        string host,
-        Func<MutationLeaseIdentity?> mutationLeaseProvider)
-    {
-        var leaseHandler = new MutationLeaseHeaderHandler(mutationLeaseProvider)
-        {
-            InnerHandler = CreateTransportHandler(host)
-        };
-        return new HttpClient(leaseHandler) { Timeout = TimeSpan.FromSeconds(30) };
-    }
-
     private static HttpMessageHandler CreateTransportHandler(string host)
     {
         if (!IsLoopbackAlias(host))
@@ -812,7 +817,7 @@ public class AgentClient : IDisposable
     /// </summary>
     public async Task<ElementInfo?> GetElementAsync(string id)
     {
-        return await GetAsync<ElementInfo>($"{UiApi}/elements/{id}");
+        return await GetAsync<ElementInfo>($"{UiApi}/elements/{Uri.EscapeDataString(id)}");
     }
 
     /// <summary>
@@ -1544,7 +1549,7 @@ public class AgentClient : IDisposable
     /// </remarks>
     public async Task<string?> GetPropertyAsync(string elementId, string propertyName)
     {
-        var (result, statusCode) = await GetJsonWithStatusAsync($"{UiApi}/elements/{elementId}/properties/{propertyName}");
+        var (result, statusCode) = await GetJsonWithStatusAsync($"{UiApi}/elements/{Uri.EscapeDataString(elementId)}/properties/{Uri.EscapeDataString(propertyName)}");
 
         if (result.ValueKind == JsonValueKind.Undefined)
         {
@@ -1585,7 +1590,7 @@ public class AgentClient : IDisposable
 
     /// <summary>Get curated editable property descriptors and current values for an element.</summary>
     public Task<JsonElement> GetPropertyDescriptorsAsync(string elementId)
-        => GetJsonAsync($"{UiApi}/elements/{elementId}/properties");
+        => GetJsonAsync($"{UiApi}/elements/{Uri.EscapeDataString(elementId)}/properties");
 
     /// <summary>
     /// Set a property value on an element.
@@ -1615,7 +1620,7 @@ public class AgentClient : IDisposable
                 };
                 AddCaptureMetadata(payload, captureEpoch, registryGeneration);
                 using var content = ProtocolJson.CreateJsonContent(payload);
-                return await _http.PutAsync($"{_baseUrl}{UiApi}/elements/{elementId}/properties/{propertyName}", content);
+                return await _http.PutAsync($"{_baseUrl}{UiApi}/elements/{Uri.EscapeDataString(elementId)}/properties/{Uri.EscapeDataString(propertyName)}", content);
             });
             return response.IsSuccessStatusCode;
         }
@@ -1635,7 +1640,7 @@ public class AgentClient : IDisposable
         };
         AddCaptureMetadata(payload, captureEpoch, registryGeneration);
         return PutActionResultAsync(
-            $"{UiApi}/elements/{elementId}/properties/{propertyName}",
+            $"{UiApi}/elements/{Uri.EscapeDataString(elementId)}/properties/{Uri.EscapeDataString(propertyName)}",
             payload);
     }
 
@@ -1716,7 +1721,56 @@ public class AgentClient : IDisposable
             return await _http.PostAsync($"{_baseUrl}{path}", content);
         });
         var responseBody = await response.Content.ReadAsStringAsync();
-        return ProtocolJson.ParseElement(responseBody);
+        if (!response.IsSuccessStatusCode)
+            throw CreateHttpRequestException(
+                $"WebView command '{method}' failed with HTTP {(int)response.StatusCode}: {responseBody}",
+                null, response.StatusCode);
+
+        var result = ParseWebViewResponse(responseBody, method);
+        ThrowIfCdpFailed(result, method);
+        return result;
+    }
+
+    private static JsonElement ParseWebViewResponse(string body, string operation)
+    {
+        try
+        {
+            return ProtocolJson.ParseElement(body);
+        }
+        catch (JsonException ex)
+        {
+            throw new JsonException($"WebView operation '{operation}' returned invalid JSON: {body}", ex);
+        }
+    }
+
+    private static void ThrowIfCdpFailed(JsonElement response, string method)
+    {
+        if (response.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException($"WebView command '{method}' returned an invalid CDP response.");
+
+        if (response.TryGetProperty("error", out var error))
+        {
+            var message = error.ValueKind == JsonValueKind.Object && error.TryGetProperty("message", out var detail)
+                ? detail.ToString() : error.ToString();
+            throw new InvalidOperationException($"WebView command '{method}' failed: {message}; response: {response.GetRawText()}");
+        }
+        if (response.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.False)
+            throw new InvalidOperationException($"WebView command '{method}' failed: {response.GetRawText()}");
+
+        if (response.TryGetProperty("result", out var result)
+            && result.ValueKind == JsonValueKind.Object
+            && result.TryGetProperty("exceptionDetails", out var exception))
+        {
+            var message = exception.ValueKind == JsonValueKind.Object
+                && exception.TryGetProperty("exception", out var exceptionValue)
+                && exceptionValue.ValueKind == JsonValueKind.Object
+                && exceptionValue.TryGetProperty("description", out var description)
+                && !string.IsNullOrWhiteSpace(description.ToString())
+                    ? description.ToString()
+                    : exception.ValueKind == JsonValueKind.Object && exception.TryGetProperty("text", out var text)
+                        ? text.ToString() : exception.GetRawText();
+            throw new InvalidOperationException($"WebView command '{method}' threw: {message}");
+        }
     }
 
     /// <summary>
@@ -1732,7 +1786,12 @@ public class AgentClient : IDisposable
         var path = $"{WebViewApi}/source";
         if (!string.IsNullOrEmpty(webviewId))
             path += $"?webview={Uri.EscapeDataString(webviewId)}";
-        return await GetStringWithTransientRetriesAsync($"{_baseUrl}{path}");
+        using var response = await SendWithTransientRetriesAsync(() => _http.GetAsync($"{_baseUrl}{path}"));
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            throw CreateHttpRequestException(
+                $"WebView source failed with HTTP {(int)response.StatusCode}: {body}", null, response.StatusCode);
+        return body;
     }
 
     public async Task<bool> NavigateWebViewAsync(string url, string? contextId = null)
@@ -1745,7 +1804,7 @@ public class AgentClient : IDisposable
         if (!string.IsNullOrWhiteSpace(contextId))
             payload["contextId"] = contextId;
 
-        return await PostActionAsync($"{WebViewApi}/navigate", payload);
+        return await PostWebViewActionAsync($"{WebViewApi}/navigate", payload);
     }
 
     public async Task<bool> ClickWebViewAsync(string selector, string? contextId = null)
@@ -1758,7 +1817,7 @@ public class AgentClient : IDisposable
         if (!string.IsNullOrWhiteSpace(contextId))
             payload["contextId"] = contextId;
 
-        return await PostActionAsync($"{WebViewApi}/input/click", payload);
+        return await PostWebViewActionAsync($"{WebViewApi}/input/click", payload);
     }
 
     public async Task<bool> FillWebViewAsync(string selector, string text, string? contextId = null)
@@ -1772,7 +1831,7 @@ public class AgentClient : IDisposable
         if (!string.IsNullOrWhiteSpace(contextId))
             payload["contextId"] = contextId;
 
-        return await PostActionAsync($"{WebViewApi}/input/fill", payload);
+        return await PostWebViewActionAsync($"{WebViewApi}/input/fill", payload);
     }
 
     public async Task<bool> InsertWebViewTextAsync(string text, string? contextId = null)
@@ -1785,7 +1844,27 @@ public class AgentClient : IDisposable
         if (!string.IsNullOrWhiteSpace(contextId))
             payload["contextId"] = contextId;
 
-        return await PostActionAsync($"{WebViewApi}/input/text", payload);
+        return await PostWebViewActionAsync($"{WebViewApi}/input/text", payload);
+    }
+
+    private async Task<bool> PostWebViewActionAsync(string path, JsonNode body)
+    {
+        using var response = await SendWithTransientRetriesAsync(HttpMethod.Post, async () =>
+        {
+            using var content = ProtocolJson.CreateJsonContent(body);
+            return await _http.PostAsync($"{_baseUrl}{path}", content);
+        });
+        var responseBody = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            throw CreateHttpRequestException(
+                $"WebView action '{path}' failed with HTTP {(int)response.StatusCode}: {responseBody}",
+                null, response.StatusCode);
+
+        var result = ParseWebViewResponse(responseBody, path);
+        ThrowIfCdpFailed(result, path);
+        if (!result.TryGetProperty("success", out var success) || success.ValueKind != JsonValueKind.True)
+            throw new InvalidOperationException($"WebView action '{path}' did not report success: {responseBody}");
+        return true;
     }
 
     public async Task<string> HitTestAsync(double x, double y, int? window = null)
@@ -2620,6 +2699,50 @@ public class AgentClient : IDisposable
         catch (Exception ex) when (IsExpectedClientException(ex)) { return default; }
     }
 
+    // ── Menus ──
+
+    /// <summary>Lists MAUI menu definitions and supported native application menus.</summary>
+    public async Task<JsonElement> GetMenusAsync(int? window = null)
+    {
+        var path = window.HasValue ? $"{UiApi}/menus?window={window.Value}" : $"{UiApi}/menus";
+        return await GetJsonAsync(path);
+    }
+
+    /// <summary>
+    /// Invokes an application menu item by id, slash-joined title path, title, or key and modifiers.
+    /// The target selects the menu layer: auto (default), maui, or native.
+    /// </summary>
+    public async Task<JsonElement> InvokeMenuAsync(
+        string? id = null,
+        string? path = null,
+        string? title = null,
+        string? key = null,
+        string? modifiers = null,
+        string? target = null,
+        int? window = null)
+    {
+        var payload = new JsonObject();
+        if (!string.IsNullOrWhiteSpace(id)) payload["id"] = id;
+        if (!string.IsNullOrWhiteSpace(path)) payload["path"] = path;
+        if (!string.IsNullOrWhiteSpace(title)) payload["title"] = title;
+        if (!string.IsNullOrWhiteSpace(key)) payload["key"] = key;
+        if (!string.IsNullOrWhiteSpace(modifiers)) payload["modifiers"] = modifiers;
+        if (!string.IsNullOrWhiteSpace(target)) payload["target"] = target;
+        if (window.HasValue) payload["window"] = window.Value;
+
+        try
+        {
+            using var response = await SendWithTransientRetriesAsync(HttpMethod.Post, async () =>
+            {
+                using var content = ProtocolJson.CreateJsonContent(payload);
+                return await _http.PostAsync($"{_baseUrl}{UiApi}/menus/invoke", content);
+            });
+            var responseBody = await response.Content.ReadAsStringAsync();
+            return string.IsNullOrWhiteSpace(responseBody) ? default : ProtocolJson.ParseElement(responseBody);
+        }
+        catch (Exception ex) when (IsExpectedClientException(ex)) { return default; }
+    }
+
     // ── Files ──
 
     public async Task<JsonElement> ListStorageRootsAsync()
@@ -3131,8 +3254,16 @@ public class AgentCapabilities
     public bool Profiler { get; set; }
     [System.Text.Json.Serialization.JsonPropertyName("jobs")]
     public bool Jobs { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("menus")]
+    public bool Menus { get; set; }
     [System.Text.Json.Serialization.JsonPropertyName("theme")]
     public bool Theme { get; set; }
+    /// <summary>
+    /// Whether gestures can be delivered as synthesised touches to raw-touch views such as
+    /// GraphicsView. True only on iOS and Mac Catalyst when the app enables the tier.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonPropertyName("syntheticTouch")]
+    public bool SyntheticTouch { get; set; }
 }
 
 public class NetworkRequest

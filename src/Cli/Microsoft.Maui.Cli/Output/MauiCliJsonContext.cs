@@ -55,6 +55,7 @@ namespace Microsoft.Maui.Cli.Output;
 [JsonSerializable(typeof(MauiProjectVersionChange))]
 [JsonSerializable(typeof(List<MauiProjectVersionChange>))]
 [JsonSerializable(typeof(MauiProjectVersionCommandResult))]
+[JsonSerializable(typeof(MauiProfileResult))]
 [JsonSerializable(typeof(MauiProjectVersionInfo))]
 [JsonSerializable(typeof(MauiVersionListResult))]
 [JsonSerializable(typeof(SimulatorCreateResult))]
@@ -74,4 +75,5 @@ namespace Microsoft.Maui.Cli.Output;
 [JsonSerializable(typeof(SimulatorScreenshotResult))]
 [JsonSerializable(typeof(SimulatorRecordingStartedResult))]
 [JsonSerializable(typeof(SimulatorRecordingResult))]
+[JsonSerializable(typeof(CliUpdateResult))]
 internal sealed partial class MauiCliJsonContext : JsonSerializerContext;

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -115,7 +116,9 @@ public sealed class InspectorServer : IDisposable
         string? platform,
         string? project,
         string? sessionId,
-        string? policyStartPath = null)
+        string? policyStartPath = null,
+        int? processId = null,
+        XamlSourceWorkspace? sourceWorkspace = null)
     {
         _port = port;
         _agentHost = agentHost;
@@ -126,19 +129,73 @@ public sealed class InspectorServer : IDisposable
         _platform = platform;
         _project = string.IsNullOrWhiteSpace(project) ? null : project;
         _sessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId;
-        _sourcePropertyEditor = new XamlSourcePropertyEditor(project, sessionId);
+        _sourcePropertyEditor = new XamlSourcePropertyEditor(
+            project,
+            sessionId,
+            TryGetProcessExecutablePath(processId, platform, project, appName),
+            workspace: sourceWorkspace);
         _alertController = new InspectorAlertController(agentHost, agentPort, appName, platform);
         _client = new AgentClient(agentHost, agentPort)
         {
             MutationLeaseHolderKind = "web-inspector",
             MutationLeaseLabel = "DevFlow Web Inspector"
         };
-        // Fall back to the inspected project so layout-diagnostics suppressions resolve even when
-        // the host does not pass an explicit policy start path.
-        _policyStartPath = string.IsNullOrWhiteSpace(policyStartPath) ? _project : policyStartPath;
-        _layoutDiagnosticsPolicy = LayoutDiagnosticsPolicyLoader.Load(_policyStartPath);
-        _projectLayoutDiagnosticsPolicy =
-            LayoutDiagnosticsPolicyLoader.LoadProjectPolicy(_policyStartPath);
+        var policyPath = string.IsNullOrWhiteSpace(policyStartPath) ? _project : policyStartPath;
+        // A filename-only app identity must never resolve against the broker's working directory.
+        _policyStartPath = !string.IsNullOrWhiteSpace(policyPath) && Path.IsPathFullyQualified(policyPath)
+            ? Path.GetFullPath(policyPath) : null;
+        _layoutDiagnosticsPolicy = _policyStartPath is null
+            ? LayoutDiagnosticsPolicyLoader.LoadUserPolicy()
+            : LayoutDiagnosticsPolicyLoader.Load(_policyStartPath);
+        _projectLayoutDiagnosticsPolicy = _policyStartPath is null
+            ? new LayoutDiagnosticsPolicy()
+            : LayoutDiagnosticsPolicyLoader.LoadProjectPolicy(_policyStartPath);
+    }
+
+    private static string? TryGetProcessExecutablePath(
+        int? processId,
+        string? platform,
+        string? project,
+        string? appName)
+    {
+        if (processId is not > 0 || !IsHostLocalPlatform(platform))
+            return null;
+
+        try
+        {
+            using var process = Process.GetProcessById(processId.Value);
+            var executablePath = process.MainModule?.FileName;
+            return ExecutableMatchesAgent(executablePath, project, appName)
+                ? executablePath
+                : null;
+        }
+        catch (Exception ex) when (ex is
+            ArgumentException or
+            InvalidOperationException or
+            UnauthorizedAccessException or
+            System.ComponentModel.Win32Exception)
+        {
+            return null;
+        }
+    }
+
+    internal static bool IsHostLocalPlatform(string? platform)
+        => platform?.Trim().ToLowerInvariant() is
+            "windows" or "winui" or "wpf" or "macos" or "appkit" or "maccatalyst" or "gtk" or "linux";
+
+    internal static bool ExecutableMatchesAgent(
+        string? executablePath,
+        string? project,
+        string? appName)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath))
+            return false;
+
+        var executableName = Path.GetFileNameWithoutExtension(executablePath);
+        var projectName = Path.GetFileNameWithoutExtension(project);
+        return !string.IsNullOrWhiteSpace(executableName) &&
+            (string.Equals(executableName, projectName, StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(executableName, appName, StringComparison.OrdinalIgnoreCase));
     }
 
     private void InvalidateScreenshotCache()
@@ -358,6 +415,23 @@ public sealed class InspectorServer : IDisposable
                 retryable = outcome.Retryable
             }));
     }
+
+    private static (int, string, byte[]) TapOutcomeResponse(
+        bool ok,
+        string? elementId,
+        string? reason,
+        int attemptedCandidates)
+        => (
+            200,
+            "application/json",
+            JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                ok,
+                elementId,
+                reason,
+                error = ok ? null : new { code = "tap-rejected", message = reason },
+                attemptedCandidates
+            }, CamelCase));
 
     private static (int, string, byte[]) UiReadOutcomeResponse(UiReadResult outcome)
     {
@@ -954,6 +1028,7 @@ public sealed class InspectorServer : IDisposable
                     "/inspector-dialog.js" => HandleEmbeddedFile("inspector-dialog.js", "application/javascript"),
                     "/inspector-data-context.js" => HandleEmbeddedFile("inspector-data-context.js", "application/javascript"),
                     "/inspector-properties.js" => HandleEmbeddedFile("inspector-properties.js", "application/javascript"),
+                    "/inspector-layout.js" => HandleEmbeddedFile("inspector-layout.js", "application/javascript"),
                     "/inspector-tree.js" => HandleEmbeddedFile("inspector-tree.js", "application/javascript"),
                     "/devflow.css" => HandleEmbeddedFile("devflow.css", "text/css"),
                     _ => (404, "text/plain", Encoding.UTF8.GetBytes("Not Found"))
@@ -998,6 +1073,7 @@ public sealed class InspectorServer : IDisposable
                     "/api/cdp/eval" => await HandleCdpEvalAsync(request.Body),
                     "/api/control" => await HandleControlAsync(request.Body, leaseId, holderKind, holderLabel),
                     "/api/diagnostics/suppress" => HandleDiagnosticSuppression(request.Body, remove: false),
+                    "/api/diagnostics/layout" => await HandleLayoutScanAsync(request.Body),
                     "/api/diagnostics/unsuppress" => HandleDiagnosticSuppression(request.Body, remove: true),
                     "/api/diagnostics/agent-payload" => HandleDiagnosticAgentPayload(request.Body),
                     _ => (404, "text/plain", Encoding.UTF8.GetBytes("Not Found"))
@@ -1049,6 +1125,10 @@ public sealed class InspectorServer : IDisposable
             .Append(BuildMeta("devflow-platform", _platform))
             .Append(BuildMeta("devflow-agent-port", _agentPort.ToString(System.Globalization.CultureInfo.InvariantCulture)))
             .ToString();
+        var title = string.IsNullOrWhiteSpace(_appName)
+            ? "MAUI DevFlow Inspector"
+            : $"MAUI DevFlow Inspector · {_appName}";
+        html = ReplaceDocumentTitle(html, title);
         html = html.Contains("</head>", StringComparison.Ordinal)
             ? html.Replace("</head>", tokenMeta + agentMeta + "</head>")
             : tokenMeta + agentMeta + html;
@@ -1059,6 +1139,26 @@ public sealed class InspectorServer : IDisposable
         => string.IsNullOrWhiteSpace(value)
             ? string.Empty
             : $"<meta name=\"{name}\" content=\"{WebUtility.HtmlEncode(value)}\">";
+
+    private static string ReplaceDocumentTitle(string html, string title)
+    {
+        var titleStart = html.IndexOf("<title", StringComparison.OrdinalIgnoreCase);
+        if (titleStart < 0)
+            return html;
+
+        var contentStart = html.IndexOf('>', titleStart);
+        if (contentStart < 0)
+            return html;
+
+        var titleEnd = html.IndexOf("</title>", contentStart + 1, StringComparison.OrdinalIgnoreCase);
+        if (titleEnd < 0)
+            return html;
+
+        return string.Concat(
+            html.AsSpan(0, contentStart + 1),
+            WebUtility.HtmlEncode(title),
+            html.AsSpan(titleEnd));
+    }
 
     /// <summary>
     /// Returns JSON state for AJAX polling: screenshot (as timestamped URL) + element divs HTML.
@@ -1105,6 +1205,8 @@ public sealed class InspectorServer : IDisposable
         var json = JsonSerializer.Serialize(new
         {
             frameId = frame.Id,
+            treeRevision = frame.TreeRevision,
+            diagnosticInputsRevision = frame.DiagnosticInputsRevision,
             screenshotUrl = $"screenshot.png?frame={Uri.EscapeDataString(frame.Id)}",
             elements = frame.ElementsHtml,
             viewportWidth = frame.Width,
@@ -1194,6 +1296,65 @@ public sealed class InspectorServer : IDisposable
             _latestLayoutDiagnosticsAt = DateTime.UtcNow;
         }
         return diagnostics;
+    }
+
+    private async Task<(int, string, byte[])> HandleLayoutScanAsync(string? body)
+    {
+        InspectorLayoutScanRequest? options;
+        try
+        {
+            options = JsonSerializer.Deserialize(body ?? "{}",
+                DevFlowCliJsonContext.Default.InspectorLayoutScanRequest);
+        }
+        catch (JsonException)
+        {
+            return BadRequest("Invalid Layout scan request.");
+        }
+        if (options is null || options.RootElementId?.Length > 1024
+            || options.Profile is not ("agent" or "strict" or "exhaustive"))
+            return BadRequest("Select a valid Layout profile and an optional root element ID.");
+
+        if (!await _diagnosticsDeltaGate.WaitAsync(0))
+            return (429, "application/json", Encoding.UTF8.GetBytes("""{"ok":false,"error":"A Layout scan is already running. Retry after it finishes."}"""));
+        try
+        {
+            var report = await _client.AnalyzeLayoutAsync(new LayoutInspectionRequest
+            {
+                Profile = options.Profile,
+                MinimumSeverity = "info",
+                IncludeEvidence = true,
+                Scope = new LayoutInspectionScope { RootElementId = options.RootElementId },
+                Privacy = new LayoutPrivacyOptions { Text = "none" },
+                Suppressions = GetLayoutSuppressions(),
+                Stability = new LayoutStabilityOptions { Mode = "wait", TimeoutMs = 2500 }
+            }, _lifetimeCts.Token);
+            if (report is null)
+                return (501, "application/json", Encoding.UTF8.GetBytes("""{"ok":false,"error":"The connected app does not support Layout diagnostics."}"""));
+
+            lock (_cacheLock)
+            {
+                _latestLayoutDiagnostics = report;
+                _latestLayoutDiagnosticsAt = DateTime.UtcNow;
+            }
+            return Ok(JsonSerializer.Serialize(new InspectorLayoutScanResponse
+            {
+                Report = report,
+                PolicyFilePath = _policyStartPath is null
+                    ? null : LayoutDiagnosticsPolicyLoader.ResolveProjectConfigPath(_policyStartPath)
+            },
+                DevFlowCliJsonContext.Default.InspectorLayoutScanResponse));
+        }
+        catch (LayoutDiagnosticsException error)
+        {
+            var payload = JsonSerializer.Serialize(new InspectorLayoutScanResponse { Ok = false, Error = error.Message },
+                DevFlowCliJsonContext.Default.InspectorLayoutScanResponse);
+            return (error.StatusCode is >= 400 and <= 599 ? error.StatusCode : 503,
+                "application/json", Encoding.UTF8.GetBytes(payload));
+        }
+        finally
+        {
+            _diagnosticsDeltaGate.Release();
+        }
     }
 
     private async Task<LayoutInspectionResult?> CaptureLayoutDiagnosticsAsync(string stabilityMode)
@@ -1332,11 +1493,22 @@ public sealed class InspectorServer : IDisposable
         string? body,
         bool remove)
     {
+        if (_policyStartPath is null)
+            return BadRequest("Layout suppressions require the inspected project's full path. Rebuild the app with MauiDevFlowIncludeProjectPath=true.");
+
         var request = JsonSerializer.Deserialize<InspectorDiagnosticRequest>(
             body ?? "{}",
             DevFlowCliJsonContext.Default.InspectorDiagnosticRequest);
         if (string.IsNullOrWhiteSpace(request?.FindingId))
             return (400, "text/plain", Encoding.UTF8.GetBytes("findingId is required"));
+        if (request.PolicyFilePath is not null && !string.Equals(request.PolicyFilePath,
+            LayoutDiagnosticsPolicyLoader.ResolveProjectConfigPath(_policyStartPath),
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            return JsonResponse(409, new
+            {
+                success = false,
+                message = "The Layout policy location changed. Rescan and confirm the current path before saving."
+            });
 
         LayoutFinding? finding;
         lock (_cacheLock)
@@ -1367,15 +1539,13 @@ public sealed class InspectorServer : IDisposable
                     {
                         var exactProjectMatches = projectPolicy.Suppressions
                             .Where(suppression =>
-                                suppression.Fingerprint?.Equals(
-                                    suppressionKey,
-                                    StringComparison.OrdinalIgnoreCase) == true)
+                                LayoutDiagnosticsSuppressionMatcher.MatchesFingerprint(
+                                    suppression.Fingerprint, suppressionKey))
                             .ToList();
                         var broadProjectMatches = projectPolicy.Suppressions
                             .Where(suppression =>
-                                suppression.Fingerprint?.Equals(
-                                    suppressionKey,
-                                    StringComparison.OrdinalIgnoreCase) != true
+                                !LayoutDiagnosticsSuppressionMatcher.MatchesFingerprint(
+                                    suppression.Fingerprint, suppressionKey)
                                 && LayoutDiagnosticsSuppressionMatcher.Matches(
                                     suppression,
                                     finding))
@@ -1396,9 +1566,8 @@ public sealed class InspectorServer : IDisposable
                         }
 
                         projectPolicy.Suppressions.RemoveAll(suppression =>
-                            suppression.Fingerprint?.Equals(
-                                suppressionKey,
-                                StringComparison.OrdinalIgnoreCase) == true);
+                            LayoutDiagnosticsSuppressionMatcher.MatchesFingerprint(
+                                suppression.Fingerprint, suppressionKey));
                     });
             }
             catch (LayoutSuppressionConflictException ex)
@@ -1425,9 +1594,8 @@ public sealed class InspectorServer : IDisposable
                 projectPolicy =>
                 {
                     if (projectPolicy.Suppressions.Any(suppression =>
-                        suppression.Fingerprint?.Equals(
-                            suppressionKey,
-                            StringComparison.OrdinalIgnoreCase) == true))
+                        LayoutDiagnosticsSuppressionMatcher.MatchesFingerprint(
+                            suppression.Fingerprint, suppressionKey)))
                     {
                         return;
                     }
@@ -1494,7 +1662,7 @@ public sealed class InspectorServer : IDisposable
         return (200, "application/json", Encoding.UTF8.GetBytes(json));
     }
 
-    private async Task<(List<ElementInfo> Tree, string Revision)> GetTreeWithRetriesAsync()
+    private async Task<(List<ElementInfo> Tree, string Revision, string? DiagnosticInputsRevision)> GetTreeWithRetriesAsync()
     {
         const int maxAttempts = 3;
         for (var attempt = 0; attempt < maxAttempts; attempt++)
@@ -1504,12 +1672,12 @@ public sealed class InspectorServer : IDisposable
             var snapshot = await _client.GetTreeSnapshotAsync(includeNative: true);
             var tree = snapshot?.Elements ?? [];
             if (tree.Count > 0)
-                return (tree, snapshot?.Revision ?? string.Empty);
+                return (tree, snapshot?.Revision ?? string.Empty, snapshot?.DiagnosticInputsRevision);
             if (attempt + 1 < maxAttempts)
                 await Task.Delay(TimeSpan.FromMilliseconds(25 * (attempt + 1)));
         }
 
-        return ([], string.Empty);
+        return ([], string.Empty, null);
     }
 
     /// <summary>
@@ -1666,7 +1834,7 @@ public sealed class InspectorServer : IDisposable
                     generation = _cacheGeneration;
                 }
 
-                var (tree, treeRevision) = await GetTreeWithRetriesAsync();
+                var (tree, treeRevision, diagnosticInputsRevision) = await GetTreeWithRetriesAsync();
                 var rootPageId = FindRootPageId(tree);
                 // Detached native roots (dialogs, native overlays) live outside the page element, so
                 // a page-scoped capture would miss them — fall back to a full-screen capture.
@@ -1701,7 +1869,8 @@ public sealed class InspectorServer : IDisposable
                     captureEpoch,
                     registryGeneration,
                     windowId,
-                    treeRevision);
+                    treeRevision,
+                    diagnosticInputsRevision);
                 lock (_cacheLock)
                 {
                     if (generation != _cacheGeneration)
@@ -1874,6 +2043,45 @@ public sealed class InspectorServer : IDisposable
 
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
+        var requestedElementId =
+            root.TryGetProperty("elementId", out var requestedElementProperty) &&
+            requestedElementProperty.ValueKind == JsonValueKind.String
+                ? requestedElementProperty.GetString()
+                : null;
+
+        // The rendered overlay is the user's explicit target. Do not fall through to a different
+        // geometric candidate when that exact target rejects the tap.
+        if (!string.IsNullOrEmpty(requestedElementId))
+        {
+            if (!TryGetActionCaptureMetadata(
+                root,
+                required: await RequiresCaptureEpochAsync(),
+                out var captureEpoch,
+                out var registryGeneration,
+                out var metadataError))
+            {
+                return CaptureMetadataError(metadataError!);
+            }
+
+            var outcome = await _client.TapResultAsync(
+                requestedElementId,
+                captureEpoch,
+                registryGeneration);
+            if (outcome.Success)
+                InvalidateScreenshotCache();
+            if (outcome.TransportFailure || outcome.Retryable ||
+                outcome.StatusCode is 408 or 409 or 429 ||
+                outcome.StatusCode >= 500)
+            {
+                return ActionOutcomeResponse(outcome);
+            }
+
+            return TapOutcomeResponse(
+                outcome.Success,
+                requestedElementId,
+                outcome.Success ? null : outcome.Reason ?? "The selected element did not accept the tap.",
+                attemptedCandidates: 1);
+        }
 
         // Coordinates are already translated into window space by devflow.js using the frame's
         // root offsets, so every browser tab acts against the exact frame it rendered.
@@ -1884,6 +2092,7 @@ public sealed class InspectorServer : IDisposable
 
             var attemptedIds = new HashSet<string>(StringComparer.Ordinal);
             var retryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var attemptedCandidates = 0;
             ActionResult? terminalOutcome = null;
             var hitOutcome = await _client.HitTestResultAsync(x, y);
             if (!hitOutcome.Success)
@@ -1900,6 +2109,7 @@ public sealed class InspectorServer : IDisposable
                     out var registryGeneration))
                     break;
 
+                attemptedCandidates++;
                 var outcome = await _client.TapResultAsync(
                     elementId!,
                     captureEpoch,
@@ -1907,7 +2117,11 @@ public sealed class InspectorServer : IDisposable
                 if (outcome.Success)
                 {
                     InvalidateScreenshotCache();
-                    return (200, "application/json", Encoding.UTF8.GetBytes("{\"ok\":true}"));
+                    return TapOutcomeResponse(
+                        true,
+                        elementId,
+                        reason: null,
+                        attemptedCandidates: attemptedCandidates);
                 }
 
                 if (outcome.TransportFailure)
@@ -1943,32 +2157,13 @@ public sealed class InspectorServer : IDisposable
             }
             if (terminalOutcome.HasValue)
                 return ActionOutcomeResponse(terminalOutcome.Value);
-            return (200, "application/json", Encoding.UTF8.GetBytes("{\"ok\":false,\"reason\":\"No tappable element at coordinates\"}"));
-        }
-
-        // Support elementId-based tap
-        if (root.TryGetProperty("elementId", out var elIdProp))
-        {
-            var elementId = elIdProp.GetString();
-            if (!string.IsNullOrEmpty(elementId))
-            {
-                if (!TryGetActionCaptureMetadata(
-                    root,
-                    required: await RequiresCaptureEpochAsync(),
-                    out var captureEpoch,
-                    out var registryGeneration,
-                    out var metadataError))
-                {
-                    return CaptureMetadataError(metadataError!);
-                }
-
-                var outcome = await _client.TapResultAsync(
-                    elementId,
-                    captureEpoch,
-                    registryGeneration);
-                InvalidateScreenshotCache();
-                return ActionOutcomeResponse(outcome);
-            }
+            return TapOutcomeResponse(
+                false,
+                elementId: null,
+                reason: attemptedCandidates > 0
+                    ? "No active element at the coordinates accepted the tap."
+                    : "No tappable element was found at the coordinates.",
+                attemptedCandidates: attemptedCandidates);
         }
 
         return (400, "application/json", Encoding.UTF8.GetBytes("{\"error\":\"x/y or elementId required\"}"));
@@ -2132,7 +2327,8 @@ public sealed class InspectorServer : IDisposable
         long? CaptureEpoch,
         long? RegistryGeneration,
         int? WindowId,
-        string TreeRevision = "");
+        string TreeRevision = "",
+        string? DiagnosticInputsRevision = null);
 
     private async Task<(int, string, byte[])> HandleProxyBackAsync()
     {
@@ -2965,10 +3161,20 @@ public sealed class InspectorServer : IDisposable
         var el = await _client.GetElementAsync(elementId);
         if (el?.SourceFile is null)
             return (200, "application/json", Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"No source available for this element.\"}"));
+        var sourcePath = _sourcePropertyEditor.ResolveSourcePath(el.SourceFile, out var sourceError);
+        if (sourcePath is null)
+        {
+            var errorPayload = JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = sourceError ?? "Could not resolve the full local source path."
+            });
+            return (200, "application/json", Encoding.UTF8.GetBytes(errorPayload));
+        }
         var payload = JsonSerializer.Serialize(new
         {
             ok = true,
-            file = el.SourceFile,
+            file = sourcePath,
             line = el.SourceLine,
             column = el.SourceColumn,
             sourceHash = el.SourceHash
@@ -2988,7 +3194,7 @@ public sealed class InspectorServer : IDisposable
     // Paths whose responses expose more than the visible tree and therefore require the read token.
     internal static bool IsTokenGatedPath(string path) => path switch
     {
-        "/api/source" or "/api/persistProperty" or "/api/logs" or "/api/network" or "/api/network/detail" or "/api/preferences"
+        "/api/source" or "/api/persistProperty" or "/api/diagnostics/layout" or "/api/logs" or "/api/network" or "/api/network/detail" or "/api/preferences"
             or "/api/device" or "/api/sensors" or "/api/geolocation"
             or "/api/files/roots" or "/api/files/list"
             or "/api/flows/files/list" or "/api/flows/files/load"
@@ -3646,6 +3852,29 @@ public sealed class InspectorServer : IDisposable
 
         [System.Text.Json.Serialization.JsonPropertyName("reason")]
         public string? Reason { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("policyFilePath")]
+        public string? PolicyFilePath { get; set; }
+    }
+
+    internal sealed class InspectorLayoutScanRequest
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("rootElementId")]
+        public string? RootElementId { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("profile")]
+        public string Profile { get; set; } = "agent";
+    }
+
+    internal sealed class InspectorLayoutScanResponse
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("ok")]
+        public bool Ok { get; set; } = true;
+        [System.Text.Json.Serialization.JsonPropertyName("report")]
+        public LayoutInspectionResult? Report { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("error")]
+        public string? Error { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("policyFilePath")]
+        public string? PolicyFilePath { get; set; }
     }
 
     internal sealed class HttpRequestInfo

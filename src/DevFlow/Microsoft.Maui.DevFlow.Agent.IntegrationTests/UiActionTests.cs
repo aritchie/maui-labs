@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Text.Json;
 using Microsoft.Maui.DevFlow.Agent.IntegrationTests.Fixtures;
 using Microsoft.Maui.DevFlow.Driver;
 using Xunit.Abstractions;
@@ -89,6 +90,28 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("items", countLabel.Text!);
 
         await CleanupAddedTodoAsync("Integration Test Todo");
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Tap_ReadOnlyInput_InvokesGesture()
+    {
+        await NavigateToPageAsync("//gestures", "TapInput");
+        try
+        {
+            var before = (await FindElementAsync("InputTapStatusLabel")).Text;
+            var input = await FindElementAsync("TapInput");
+
+            Assert.True(await Client.TapAsync(input.Id));
+            await WaitForAsync(async () => (await FindElementAsync("InputTapStatusLabel")).Text != before);
+
+            Assert.StartsWith("input tap: ", (await FindElementAsync("InputTapStatusLabel")).Text);
+            Assert.Equal("Tap to select an item", (await FindElementAsync("TapInput")).Text);
+        }
+        finally
+        {
+            await NavigateToMainPageAsync();
+        }
     }
 
     [Fact]
@@ -321,14 +344,30 @@ public class UiActionTests : IntegrationTestBase
         using var response = await PostRawAsync("/api/v1/ui/actions/gesture", new { type = "wiggle" });
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         var body = await response.Content.ReadAsStringAsync();
-        Assert.Contains("Supported types", body);
+        if (TestFramework.IsNative)
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(body);
+            Assert.Contains("not supported", document.RootElement.GetProperty("error").GetString());
+        }
+        else
+            Assert.Contains("Supported types", body);
     }
 
     [Fact]
     public async Task Capabilities_AdvertisesSupportedGestures()
     {
         var caps = await GetJsonAsync("/api/v1/agent/capabilities");
-        var gestures = caps.GetProperty("capabilities").GetProperty("ui.actions").GetProperty("gestures")
+        var actions = caps.GetProperty("capabilities").GetProperty("ui.actions");
+        Assert.True(actions.GetProperty("supported").GetBoolean());
+        if (TestFramework.IsNative)
+        {
+            Assert.Equal(1, actions.GetProperty("version").GetInt32());
+            var features = actions.GetProperty("features").EnumerateArray().Select(feature => feature.GetString()).ToArray();
+            Assert.Contains("gesture", features);
+            Assert.Contains("tap", features);
+            return;
+        }
+        var gestures = actions.GetProperty("gestures")
             .EnumerateArray().Select(g => g.GetString()).ToArray();
 
         Assert.Contains("pinch", gestures);
@@ -343,6 +382,7 @@ public class UiActionTests : IntegrationTestBase
     private Task NavigateToGesturePageAsync() => NavigateToPageAsync("//gestures", "PinchTarget");
 
     [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task Pinch_FiresPinchGestureRecognizer()
     {
         await NavigateToGesturePageAsync();
@@ -360,6 +400,7 @@ public class UiActionTests : IntegrationTestBase
     }
 
     [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task Pinch_ZoomOut_ReportsScaleBelowOne()
     {
         await NavigateToGesturePageAsync();
@@ -375,6 +416,7 @@ public class UiActionTests : IntegrationTestBase
     }
 
     [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task Pan_FiresPanGestureRecognizerWithCumulativeTotals()
     {
         await NavigateToGesturePageAsync();
@@ -391,6 +433,7 @@ public class UiActionTests : IntegrationTestBase
     }
 
     [Theory]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [InlineData("up")]
     [InlineData("down")]
     [InlineData("left")]
@@ -410,7 +453,332 @@ public class UiActionTests : IntegrationTestBase
         Assert.Equal($"swipe: {direction}", status.Text);
     }
 
+    // ========== raw-touch tier: views that take their touches directly ==========
+    // A GraphicsView overrides the platform touch methods and installs no gesture recognizer,
+    // so nothing above can service it. Android delivers real MotionEvents; iOS and Mac Catalyst
+    // synthesise UITouches, which the sample opts into with AgentOptions.EnableSyntheticTouch,
+    // and only to an allow-list of views. The status label reports the whole sequence, so these
+    // assert what the app actually received rather than an HTTP 200.
+
+    private bool SupportsRawTouchInjection =>
+        Platform.Equals("android", StringComparison.OrdinalIgnoreCase)
+        || Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+        || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<ElementInfo> FindRawTouchTargetAsync()
+    {
+        await NavigateToGesturePageAsync();
+        // MakeVisible can leave an edge against the viewport clip; both pinch fingers
+        // need to hit the canvas, not just its centre.
+        Assert.True(await Client.ScrollAsync("RawTouchTarget", animated: false, scrollToPosition: "center"));
+        await SettleAsync();
+        return await WaitForRawTouchViewportAsync();
+    }
+
+    private async Task<ElementInfo> WaitForRawTouchViewportAsync()
+    {
+        ElementInfo? target = null;
+        await WaitForAsync(async () =>
+        {
+            target = await FindElementAsync("RawTouchTarget");
+            var viewport = await FindElementAsync("GestureScrollView");
+            var bounds = target.WindowBounds;
+            var visible = viewport.WindowBounds;
+            if (bounds == null || visible == null || bounds.Width <= 4 || bounds.Height <= 4
+                || bounds.X < visible.X + 4 || bounds.Y < visible.Y + 4
+                || bounds.X + bounds.Width > visible.X + visible.Width - 4
+                || bounds.Y + bounds.Height > visible.Y + visible.Height - 4)
+                return false;
+
+            foreach (var x in new[] { bounds.X + 2, bounds.X + bounds.Width - 2 })
+            foreach (var y in new[] { bounds.Y + 2, bounds.Y + bounds.Height - 2 })
+            {
+                using var hit = JsonDocument.Parse(await Client.HitTestAsync(x, y));
+                var elements = hit.RootElement.GetProperty("elements");
+                if (elements.GetArrayLength() == 0 || elements[0].GetProperty("id").GetString() != target.Id)
+                    return false;
+            }
+
+            Output.WriteLine($"Raw-touch canvas ({bounds.X}, {bounds.Y}, {bounds.Width}, {bounds.Height}) " +
+                $"is inside viewport ({visible.X}, {visible.Y}, {visible.Width}, {visible.Height}); all four corners hit {target.Id}.");
+            return true;
+        });
+        return Assert.IsType<ElementInfo>(target);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
+    public async Task Pinch_OnRawTouchView_ArrivesAsTwoTouches()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.PinchAsync(target.Id, scale: 0.5);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        // Two simultaneous pointers is the whole point: a single-pointer approximation
+        // cannot produce a scale at all.
+        Assert.Contains("maxtouches=2", status.Text);
+        Assert.Contains("scale=0.50", status.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Pan_OnRawTouchView_DeliversTheWholeDrag()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.PanAsync(target.Id, deltaX: 80, deltaY: 0);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.Contains("dx=80", status.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Pan_OnRawTouchViewInsideAScrollView_IsNotStolenByTheScrollView()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        // Vertical, inside a vertical ScrollView: the case where the enclosing scroller
+        // takes the gesture away from the element the caller actually named.
+        var result = await Client.PanAsync(target.Id, deltaX: 0, deltaY: 60);
+
+        Assert.True(result.Success, result.Error);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.Contains("dy=60", status.Text);
+    }
+
+    private static int ReadRawTouchDx(string? statusText)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(statusText ?? "", @"dx=(-?\d+)");
+        Assert.True(match.Success, $"No dx in '{statusText}'");
+        return int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Swipe_OnRawTouchView_ArrivesAsADrag()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.True(ReadRawTouchDx(status.Text) > 0, status.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Swipe_OnRawTouchView_WithNativeAncestorSwipe_PrefersTheChild()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Native UIKit swipe recognizers are not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+        var before = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.StartsWith("native swipe: count=", before.Text);
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+        Assert.Contains("Synthetic UITouch", result.Detail);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.True(ReadRawTouchDx(status.Text) > 0, status.Text);
+        var after = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.Equal(before.Text, after.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Swipe_OnViewWithoutLocalHandling_FallsBackToNativeAncestorSwipe()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Native UIKit swipe recognizers are not available on {Platform}.");
+            return;
+        }
+
+        await FindRawTouchTargetAsync();
+        var target = await FindElementAsync("NativeSwipeProbeTarget");
+        var before = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.StartsWith("native swipe: count=", before.Text);
+
+        var result = await Client.GestureDetailedAsync("swipe", target.Id, "right");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+        Assert.Equal("UISwipeGestureRecognizer right", result.Detail);
+
+        await SettleAsync();
+        var after = await FindElementAsync("NativeSwipeStatusLabel");
+        Assert.NotEqual(before.Text, after.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Pan_OnRawTouchView_LongerThanTheView_IsShortenedToStayOnIt()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        // Started centred and offset by half the delta, a drag this long would begin far off
+        // the canvas and land on whatever sits beside it.
+        var result = await Client.PanAsync(target.Id, deltaX: 5000, deltaY: 0);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.InRange(ReadRawTouchDx(status.Text), 1, 4999);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Theory]
+    [InlineData(0.0, 0.0)]
+    [InlineData(1.0, 1.0)]
+    public async Task Pinch_OnRawTouchView_FromAnEdgeOrigin_KeepsBothFingersOnTheView(double originX, double originY)
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Raw-touch injection is not available on {Platform}.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+
+        var result = await Client.PinchAsync(target.Id, scale: 0.5, originX: originX, originY: originY);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+
+        await SettleAsync();
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.Contains("maxtouches=2", status.Text);
+        Assert.Contains("scale=0.50", status.Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Pinch_OnRawTouchView_WithClippedBottomEdge_IsRefusedBeforeTouchCallbacks()
+    {
+        if (!SupportsSyntheticTouch)
+            return;
+
+        var target = await FindRawTouchTargetAsync();
+        var viewport = await FindElementAsync("GestureScrollView");
+        Assert.True(await Client.ScrollAsync(target.Id, animated: false, scrollToPosition: "end"));
+        Assert.True(await Client.ScrollAsync(viewport.Id, deltaY: -16, animated: false));
+        await WaitForAsync(async () =>
+        {
+            target = await FindElementAsync("RawTouchTarget");
+            viewport = await FindElementAsync("GestureScrollView");
+            var bounds = Assert.IsType<BoundsInfo>(target.WindowBounds);
+            var visible = Assert.IsType<BoundsInfo>(viewport.WindowBounds);
+            return bounds.Y + bounds.Height > visible.Y + visible.Height + 8
+                && bounds.Y + bounds.Height / 2 < visible.Y + visible.Height;
+        });
+
+        const string awaitingTouch = "rawtouch: awaiting edge pinch";
+        Assert.True(await Client.SetPropertyAsync("RawTouchStatusLabel", "Text", awaitingTouch));
+        var result = await Client.PinchAsync(target.Id, scale: 0.5, originX: 1, originY: 1);
+        Assert.False(result.Success);
+        Assert.Equal("none", result.HandledBy);
+        Assert.Contains("No pinch handler", result.Error);
+        Assert.Equal(awaitingTouch, (await FindElementAsync("RawTouchStatusLabel")).Text);
+
+        Assert.True(await Client.ScrollAsync(target.Id, animated: false, scrollToPosition: "center"));
+        target = await WaitForRawTouchViewportAsync();
+        result = await Client.PinchAsync(target.Id, scale: 0.5, originX: 1, originY: 1);
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("native", result.HandledBy);
+        var status = await FindElementAsync("RawTouchStatusLabel");
+        Assert.Contains("ended maxtouches=2", status.Text);
+        Assert.Contains("scale=0.50", status.Text);
+    }
+
+    // UIKit-only: Android delivers real touches to the named view, which behave exactly as a
+    // finger would — including pressing a button that is dragged across.
+    private bool SupportsSyntheticTouch =>
+        Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+        || Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase);
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task Pan_OnAnOrdinaryButton_NeverDeliversSyntheticTouches()
+    {
+        if (!SupportsSyntheticTouch)
+        {
+            Output.WriteLine($"Synthetic touch is UIKit-only; skipping on {Platform}.");
+            return;
+        }
+
+        await NavigateToGesturePageAsync();
+        await Client.ScrollAsync("SyntheticTouchGuardButton");
+        await SettleAsync();
+        var button = await FindElementAsync("SyntheticTouchGuardButton");
+
+        // UIButton overrides touchesBegan:, which is exactly what used to qualify a view for
+        // synthesised touches. Vertical, so no enclosing horizontal pan (Shell's flyout) is involved.
+        await Client.PanAsync(button.Id, deltaX: 0, deltaY: 10);
+
+        // Whether another tier claims the pan is beside the point: the button must not be pressed.
+        await SettleAsync();
+        var status = await FindElementAsync("GuardStatusLabel");
+        Assert.Equal("guard: pressed=0 clicked=0", status.Text);
+    }
+
+    [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task DoubleTap_FiresTwoTapRecognizerNotTheSingleTapOne()
     {
         await NavigateToGesturePageAsync();
@@ -432,15 +800,24 @@ public class UiActionTests : IntegrationTestBase
         await NavigateToPageAsync("//interactions", "TestButton");
         var target = await FindElementAsync("TestButton");
 
-        var result = await Client.GestureDetailedAsync(
-            "tap",
-            target.Id,
-            captureEpoch: target.CaptureEpoch,
-            registryGeneration: target.RegistryGeneration);
+        if (TestFramework.IsNative)
+        {
+            var result = await PostJsonAsync("/api/v1/ui/actions/gesture", new { type = "tap", elementId = target.Id });
+            Assert.True(result.GetProperty("success").GetBoolean());
+            Assert.Equal("Gesture performed", result.GetProperty("message").GetString());
+        }
+        else
+        {
+            var result = await Client.GestureDetailedAsync(
+                "tap",
+                target.Id,
+                captureEpoch: target.CaptureEpoch,
+                registryGeneration: target.RegistryGeneration);
 
-        Assert.True(result.Success, result.Error);
-        Assert.Equal("tap", result.Type);
-        Assert.Equal("action", result.HandledBy);
+            Assert.True(result.Success, result.Error);
+            Assert.Equal("tap", result.Type);
+            Assert.Equal("action", result.HandledBy);
+        }
 
         await SettleAsync();
         var status = await FindElementAsync("StatusLabel");
@@ -454,7 +831,7 @@ public class UiActionTests : IntegrationTestBase
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         var body = await response.Content.ReadAsStringAsync();
-        Assert.Contains("tap requires elementId", body);
+        Assert.Contains(TestFramework.IsNative ? "elementId is required to tap" : "tap requires elementId", body);
     }
 
     [Trait(TestFramework.Trait, TestFramework.Maui)]
@@ -485,6 +862,7 @@ public class UiActionTests : IntegrationTestBase
     }
 
     [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task Pinch_OnElementWithoutRecognizer_ReportsWhichTierRan()
     {
         await NavigateToGesturePageAsync();
@@ -508,6 +886,7 @@ public class UiActionTests : IntegrationTestBase
     }
 
     [Fact]
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     public async Task Pan_OnElementWithoutRecognizer_FallsThroughToNative()
     {
         await NavigateToGesturePageAsync();

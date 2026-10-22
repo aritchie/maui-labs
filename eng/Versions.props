@@ -6,7 +6,7 @@
     <PatchVersion>0</PatchVersion>
     <VersionPrefix>$(MajorVersion).$(MinorVersion).$(PatchVersion)</VersionPrefix>
     <PreReleaseVersionLabel>preview</PreReleaseVersionLabel>
-    <PreReleaseVersionIteration>12</PreReleaseVersionIteration>
+    <PreReleaseVersionIteration>13</PreReleaseVersionIteration>
     <StabilizePackageVersion>false</StabilizePackageVersion>
     <!-- Arcade features -->
     <UsingToolXliff>false</UsingToolXliff>
@@ -62,7 +62,7 @@
     <ModelContextProtocolVersion>1.1.0</ModelContextProtocolVersion>
     <InteropUIAutomationClientVersion>10.19041.0</InteropUIAutomationClientVersion>
     <MicrosoftCodeAnalysisCSharpVersion>4.14.0</MicrosoftCodeAnalysisCSharpVersion>
-    <MicrosoftOpenApiVersion>3.5.0</MicrosoftOpenApiVersion>
+    <MicrosoftOpenApiVersion>3.5.4</MicrosoftOpenApiVersion>
     <YamlDotNetVersion>16.3.0</YamlDotNetVersion>
   </PropertyGroup>
   <!-- Android platform tooling (managed via darc/maestro — see eng/Version.Details.xml) -->
@@ -71,7 +71,7 @@
   </PropertyGroup>
   <!-- Apple platform tooling (managed via darc/maestro — see eng/Version.Details.xml) -->
   <PropertyGroup Label="Apple Tools">
-    <XamarinAppleToolsMaciOSVersion>1.0.0-preview.1.26301.3</XamarinAppleToolsMaciOSVersion>
+    <XamarinAppleToolsMaciOSVersion>1.0.0-preview.1.26521.1</XamarinAppleToolsMaciOSVersion>
   </PropertyGroup>
   <PropertyGroup Label="Platform Extensions">
     <PlatformMauiLinuxGtk4Version>0.6.0</PlatformMauiLinuxGtk4Version>
@@ -89,7 +89,7 @@
     <EssentialsAIMinorVersion>0</EssentialsAIMinorVersion>
     <EssentialsAIPatchVersion>0</EssentialsAIPatchVersion>
     <EssentialsAIPreReleaseVersionLabel>preview</EssentialsAIPreReleaseVersionLabel>
-    <EssentialsAIPreviewVersionIteration>6</EssentialsAIPreviewVersionIteration>
+    <EssentialsAIPreviewVersionIteration>7</EssentialsAIPreviewVersionIteration>
     <!-- Microsoft Extensions AI -->
     <MicrosoftExtensionsAIAbstractionsVersion>10.4.1</MicrosoftExtensionsAIAbstractionsVersion>
     <!-- Microsoft Agents AI (sample only) -->
@@ -102,6 +102,10 @@
   </PropertyGroup>
   <PropertyGroup Label="Testing">
     <MicrosoftNETTestSdkVersion>18.3.0</MicrosoftNETTestSdkVersion>
+    <MicrosoftTestingPlatformVersion>2.3.2</MicrosoftTestingPlatformVersion>
+    <MSTestVersion>4.3.2</MSTestVersion>
+    <NUnitVersion>4.4.0</NUnitVersion>
+    <NUnit3TestAdapterVersion>6.2.0</NUnit3TestAdapterVersion>
     <XunitVersion>2.9.3</XunitVersion>
     <XunitRunnerVisualstudioVersion>3.1.5</XunitRunnerVisualstudioVersion>
     <CoverletCollectorVersion>8.0.0</CoverletCollectorVersion>

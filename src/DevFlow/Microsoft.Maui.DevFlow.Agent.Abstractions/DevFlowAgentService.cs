@@ -605,6 +605,12 @@ public partial class DevFlowAgentService : IDisposable, IMarkerPublisher
                             DeltaY = action.DeltaY,
                             OriginX = action.OriginX,
                             OriginY = action.OriginY,
+                            X = action.X,
+                            Y = action.Y,
+                            ToX = action.ToX,
+                            ToY = action.ToY,
+                            ToElementId = action.ToElementId,
+                            HoldMs = action.HoldMs,
                             Steps = action.Steps
                         })
                     });

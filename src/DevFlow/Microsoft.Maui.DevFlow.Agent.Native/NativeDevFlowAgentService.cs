@@ -352,6 +352,12 @@ public class NativeDevFlowAgentService : DevFlowAgentService
         if (body == null || string.IsNullOrWhiteSpace(body.Type))
             return HttpResponse.Error("type is required");
 
+        // A drag from a point (or onto a drop target) needs touch injection this agent does not
+        // have; a plain gesture on the element instead would report success for the wrong input.
+        if (body.X.HasValue || body.Y.HasValue || body.ToX.HasValue || body.ToY.HasValue
+            || !string.IsNullOrWhiteSpace(body.ToElementId))
+            return HttpResponse.Error("A gesture at a point is not supported by this agent");
+
         var startedAtUtc = DateTime.UtcNow;
         var result = await DispatchAsync(() =>
         {

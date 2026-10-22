@@ -684,6 +684,10 @@ public partial class DevFlowAgentService
         public double? OriginY { get; set; }
         public double? X { get; set; }
         public double? Y { get; set; }
+        public double? ToX { get; set; }
+        public double? ToY { get; set; }
+        public string? ToElementId { get; set; }
+        public int? HoldMs { get; set; }
         public int? Steps { get; set; }
     }
 
@@ -720,6 +724,10 @@ public partial class DevFlowAgentService
         public double? OriginY { get; set; }
         public double? X { get; set; }
         public double? Y { get; set; }
+        public double? ToX { get; set; }
+        public double? ToY { get; set; }
+        public string? ToElementId { get; set; }
+        public int? HoldMs { get; set; }
         public int? Steps { get; set; }
         public JsonElement[]? Args { get; set; }
         public string? Name { get; set; }

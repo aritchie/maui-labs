@@ -9,7 +9,7 @@ namespace Microsoft.Maui.DevFlow.Agent.Core;
 public partial class MauiDevFlowAgentService
 {
     internal static readonly string[] SupportedGestures =
-        ["tap", "doubletap", "longpress", "swipe", "pan", "pinch", "rotate"];
+        ["tap", "doubletap", "longpress", "swipe", "pan", "drag", "pinch", "rotate"];
 
     private const int DefaultGestureSteps = 10;
     private int _panGestureId;
@@ -22,7 +22,9 @@ public partial class MauiDevFlowAgentService
         var body = request.BodyAs<GestureActionRequest>();
         if (body == null || string.IsNullOrWhiteSpace(body.Type))
             return HttpResponse.Error("type is required");
-        if (await PrepareUiMutationAsync(request, body, body.ElementId) is { } staleCapture)
+        // A drop target is part of the same capture as the dragged element: a drag aimed at an
+        // id from some other snapshot could land on whatever now holds it.
+        if (await PrepareUiMutationAsync(request, body, body.ElementId, body.ToElementId) is { } staleCapture)
             return staleCapture;
 
         var startedAtUtc = DateTime.UtcNow;
@@ -48,6 +50,14 @@ public partial class MauiDevFlowAgentService
             outcome = tapResponse.StatusCode < 400
                 ? GestureOutcome.Handled("action", "DevFlow tap action")
                 : GestureOutcome.NotHandled(ExtractResponseError(tapResponse) ?? "Tap failed");
+        }
+        else if (gestureType == "pan" && IsPointDrag(body))
+        {
+            // A drag from a point is a real touch along a path, the way a finger moves a slider's
+            // thumb or carries an item to a drop target. It is reported as a drag so the response
+            // says which of the two very different deliveries ran.
+            gestureType = "drag";
+            outcome = await PerformPointDragAsync(request, body, reservedCapture);
         }
         else
         {
@@ -124,6 +134,10 @@ public partial class MauiDevFlowAgentService
             _ => normalized
         };
     }
+
+    private static bool IsPointDrag(GestureActionRequest body) =>
+        body.X.HasValue || body.Y.HasValue || body.ToX.HasValue || body.ToY.HasValue
+        || !string.IsNullOrWhiteSpace(body.ToElementId);
 
     private static double SwipeDeltaX(string? direction, double distance) =>
         direction?.Equals("left", StringComparison.OrdinalIgnoreCase) == true ? -distance :
@@ -553,14 +567,101 @@ public partial class MauiDevFlowAgentService
     /// Delivers a touch down and up at <paramref name="point"/> — device-independent units from
     /// the element's top-left, already checked to lie inside it.
     /// </summary>
-    protected virtual Task<PointTapResult> TryNativePointTapAsync(VisualElement element, Point point)
-        => Task.FromResult(PointTapResult.Failed(
+    protected virtual Task<PointTouchResult> TryNativePointTapAsync(VisualElement element, Point point)
+        => Task.FromResult(PointTouchResult.Failed(
             $"Tap at a point is not supported on {DeviceInfo.Platform}"));
 
-    /// <summary>What serviced a tap at a point, or why none could be delivered.</summary>
-    protected readonly record struct PointTapResult(bool Handled, string Message)
+    /// <summary>
+    /// A drag delivered as a real touch: down at a point on the element, moving to an end point,
+    /// then up. Content that tracks the finger itself — a custom slider's thumb, a reorderable
+    /// list, a pan-driven drag and drop between two views — runs exactly as it would for a user,
+    /// including recognizers that compete for the touch (a tap on the same view must not fire
+    /// after a drag). Never falls back to driving the element's PanGestureRecognizer directly:
+    /// that skips the touch pipeline, so it would report success for input no finger produced.
+    /// </summary>
+    private async Task<GestureOutcome> PerformPointDragAsync(
+        HttpRequest request, GestureActionRequest body, UiCaptureContext capture)
     {
-        public static PointTapResult Delivered(string detail) => new(true, detail);
-        public static PointTapResult Failed(string reason) => new(false, reason);
+        var deltaX = body.DeltaX ?? (body.Direction != null ? SwipeDeltaX(body.Direction, body.Distance) : null);
+        var deltaY = body.DeltaY ?? (body.Direction != null ? SwipeDeltaY(body.Direction, body.Distance) : null);
+        if (SyntheticTouchGeometry.TryPlanPointDrag(
+                body.X, body.Y, body.ToX, body.ToY, !string.IsNullOrWhiteSpace(body.ToElementId),
+                deltaX, deltaY, out var plan) is { } invalid)
+            return GestureOutcome.NotHandled(invalid);
+        if (string.IsNullOrWhiteSpace(body.ElementId))
+            return GestureOutcome.NotHandled("A drag from a point needs elementId: x and y are measured from that element");
+
+        var steps = NormalizeSteps(body.Steps);
+        var durationMs = GestureDurationMs(body);
+        var holdMs = Math.Clamp(body.HoldMs ?? 0, 0, 10_000);
+        var outcome = await DispatchAsync(async () =>
+        {
+            var (element, sourceError) = ResolvePointDragElement(capture, body.ElementId, "dragged element");
+            if (element == null)
+                return GestureOutcome.NotHandled(sourceError!);
+
+            CaptureMutationTarget(request, element);
+            if (SyntheticTouchGeometry.ForTap(element.Width, element.Height, plan.FromX, plan.FromY) is null)
+                return GestureOutcome.NotHandled(
+                    $"Start point ({plan.FromX:0.#}, {plan.FromY:0.#}) is outside the element's {element.Width:0.#}x{element.Height:0.#} bounds");
+
+            var endElement = element;
+            if (!string.IsNullOrWhiteSpace(body.ToElementId))
+            {
+                var (target, targetError) = ResolvePointDragElement(capture, body.ToElementId, "drop target");
+                if (target == null)
+                    return GestureOutcome.NotHandled(targetError!);
+                endElement = target;
+            }
+
+            var end = plan.ToX is { } toX && plan.ToY is { } toY
+                ? new Point(toX, toY)
+                : new Point(endElement.Width / 2, endElement.Height / 2);
+            // A drop has to land on its target; an end on the element itself may run past its
+            // edge, as a finger dragging a thumb to the end of its track does.
+            if (!ReferenceEquals(endElement, element)
+                && SyntheticTouchGeometry.ForTap(endElement.Width, endElement.Height, end.X, end.Y) is null)
+                return GestureOutcome.NotHandled(
+                    $"End point ({end.X:0.#}, {end.Y:0.#}) is outside the drop target's {endElement.Width:0.#}x{endElement.Height:0.#} bounds");
+
+            var result = await TryNativePointDragAsync(
+                element, new Point(plan.FromX, plan.FromY), endElement, end, holdMs, durationMs, steps);
+            return result.Handled ? GestureOutcome.Native(result.Message) : GestureOutcome.NotHandled(result.Message);
+        });
+
+        return outcome ?? GestureOutcome.NotHandled("Drag dispatch failed");
+    }
+
+    private (VisualElement? Element, string? Error) ResolvePointDragElement(
+        UiCaptureContext capture, string elementId, string role)
+    {
+        if (IsNativeElementId(elementId))
+            return (null, $"The {role} must be a MAUI element; native element ids are not supported");
+
+        return ResolveCapturedElement(capture, elementId, id => _treeWalker.GetElementById(id, _app)) switch
+        {
+            VisualElement element => (element, null),
+            null => (null, $"The {role} '{elementId}' was not found"),
+            var other => (null, $"The {role} '{elementId}' is a {other.GetType().Name}, which cannot receive touches")
+        };
+    }
+
+    /// <summary>
+    /// Delivers one finger pressed at <paramref name="from"/> on <paramref name="element"/>, held for
+    /// <paramref name="holdMs"/>, moved in <paramref name="steps"/> over <paramref name="durationMs"/>
+    /// to <paramref name="to"/> on <paramref name="endElement"/>, and lifted there. Both points are
+    /// device-independent units from their element's top-left; the start is already checked to
+    /// lie inside <paramref name="element"/>.
+    /// </summary>
+    protected virtual Task<PointTouchResult> TryNativePointDragAsync(
+        VisualElement element, Point from, VisualElement endElement, Point to, int holdMs, int durationMs, int steps)
+        => Task.FromResult(PointTouchResult.Failed(
+            $"A drag from a point is not supported on {DeviceInfo.Platform}"));
+
+    /// <summary>What serviced a touch at a point, or why none could be delivered.</summary>
+    protected readonly record struct PointTouchResult(bool Handled, string Message)
+    {
+        public static PointTouchResult Delivered(string detail) => new(true, detail);
+        public static PointTouchResult Failed(string reason) => new(false, reason);
     }
 }

@@ -103,6 +103,15 @@ internal sealed class NativeUiOperations(AgentClient client)
             scale, rotation, deltaX, deltaY, originX, originY, steps, epoch, generation);
     }
 
+    internal Task<GestureResult> DragAsync(
+        ElementInfo element, double x, double y, double? toX, double? toY, string? toElementId,
+        int? holdMs, int? durationMs, int? steps)
+    {
+        var (epoch, generation) = GetCaptureMetadata(element);
+
+        return client.DragAsync(element.Id, x, y, toX, toY, toElementId, holdMs, durationMs, steps, epoch, generation);
+    }
+
     internal async Task<(List<ElementInfo> Elements, bool TimedOut)> QueryAsync(
         string? type, string? automationId, string? text, string? selector = null,
         string? waitUntil = null, int timeout = 0)

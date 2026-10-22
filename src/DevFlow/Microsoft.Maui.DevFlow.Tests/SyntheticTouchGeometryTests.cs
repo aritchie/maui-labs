@@ -167,4 +167,61 @@ public class SyntheticTouchGeometryTests
     [InlineData(double.NaN, Height)]
     public void Tap_OnAViewWithNoArea_IsRefused(double width, double height)
         => Assert.Null(SyntheticTouchGeometry.ForTap(width, height, 0, 0));
+
+    [Fact]
+    public void PointDrag_ToAPoint_EndsThereUnchanged()
+    {
+        // Past the right edge on purpose: dragging a thumb to the end of its track overshoots it.
+        var error = SyntheticTouchGeometry.TryPlanPointDrag(4, 12, 900, 12, false, null, null, out var plan);
+
+        Assert.Null(error);
+        Assert.Equal(new SyntheticTouchGeometry.PointDrag(4, 12, 900, 12), plan);
+    }
+
+    [Fact]
+    public void PointDrag_ByAVector_EndsThatFarFromTheStart()
+    {
+        var error = SyntheticTouchGeometry.TryPlanPointDrag(20, 30, null, null, false, -15, 40, out var plan);
+
+        Assert.Null(error);
+        Assert.Equal(new SyntheticTouchGeometry.PointDrag(20, 30, 5, 70), plan);
+    }
+
+    [Fact]
+    public void PointDrag_OntoADropTarget_WithNoPointEndsAtItsCentre()
+    {
+        var error = SyntheticTouchGeometry.TryPlanPointDrag(20, 30, null, null, true, null, null, out var plan);
+
+        Assert.Null(error);
+        Assert.Null(plan.ToX);
+        Assert.Null(plan.ToY);
+    }
+
+    [Fact]
+    public void PointDrag_OntoADropTarget_KeepsThePointOnTheTarget()
+    {
+        var error = SyntheticTouchGeometry.TryPlanPointDrag(20, 30, 5, 6, true, null, null, out var plan);
+
+        Assert.Null(error);
+        Assert.Equal(new SyntheticTouchGeometry.PointDrag(20, 30, 5, 6), plan);
+    }
+
+    [Theory]
+    [InlineData(null, 10.0, 50.0, 10.0, false, null, null, "both x and y")]
+    [InlineData(10.0, 10.0, 50.0, null, false, null, null, "together")]
+    [InlineData(10.0, 10.0, null, null, false, null, null, "needs an end")]
+    [InlineData(10.0, 10.0, null, null, false, 0.0, 0.0, "needs an end")]
+    [InlineData(10.0, 10.0, 50.0, 10.0, false, 5.0, null, "once")]
+    [InlineData(10.0, 10.0, null, null, true, 5.0, null, "once")]
+    [InlineData(double.NaN, 10.0, 50.0, 10.0, false, null, null, "finite")]
+    [InlineData(10.0, 10.0, double.PositiveInfinity, 10.0, false, null, null, "finite")]
+    public void PointDrag_IncompleteOrAmbiguous_IsRefusedWithTheReason(
+        double? x, double? y, double? toX, double? toY, bool hasDropTarget,
+        double? deltaX, double? deltaY, string reason)
+    {
+        var error = SyntheticTouchGeometry.TryPlanPointDrag(x, y, toX, toY, hasDropTarget, deltaX, deltaY, out _);
+
+        Assert.NotNull(error);
+        Assert.Contains(reason, error);
+    }
 }

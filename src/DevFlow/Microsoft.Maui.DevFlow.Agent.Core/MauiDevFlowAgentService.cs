@@ -3694,8 +3694,9 @@ public partial class MauiDevFlowAgentService : DevFlowAgentService
         var reservation = ReserveUiCapture(body);
         if (reservation.Error is not null)
             return reservation.Error;
+        // A drag's drop target is a referenced target too.
         foreach (var elementId in body.Actions
-            .Select(action => action.ElementId)
+            .SelectMany(action => new[] { action.ElementId, action.ToElementId })
             .Distinct(StringComparer.Ordinal))
         {
             if (await ValidateCapturedElementIdentityAsync(reservation.Capture, elementId) is { } identityError)
@@ -3712,9 +3713,9 @@ public partial class MauiDevFlowAgentService : DevFlowAgentService
                 var actionName = (action.Action ?? action.Type ?? string.Empty).Trim().ToLowerInvariant();
                 HttpResponse response;
 
-                if (await ValidateCapturedElementIdentityAsync(
-                    reservation.Capture,
-                    action.ElementId) is { } identityError)
+                var identityError = await ValidateCapturedElementIdentityAsync(reservation.Capture, action.ElementId)
+                    ?? await ValidateCapturedElementIdentityAsync(reservation.Capture, action.ToElementId);
+                if (identityError is not null)
                 {
                     response = identityError;
                 }
@@ -3831,6 +3832,12 @@ public partial class MauiDevFlowAgentService : DevFlowAgentService
                                     DeltaY = action.DeltaY,
                                     OriginX = action.OriginX,
                                     OriginY = action.OriginY,
+                                    X = action.X,
+                                    Y = action.Y,
+                                    ToX = action.ToX,
+                                    ToY = action.ToY,
+                                    ToElementId = action.ToElementId,
+                                    HoldMs = action.HoldMs,
                                     Steps = action.Steps
                                 })
                             });

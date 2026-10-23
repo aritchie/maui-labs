@@ -110,7 +110,8 @@ public class AndroidProvider : IAndroidProvider
 		});
 
 		// Check SDK Manager
-		if (!_sdkManager.IsAvailable)
+		var commandLineTools = _sdkManager.FindCommandLineTools();
+		if (commandLineTools is null)
 		{
 			checks.Add(new HealthCheck
 			{
@@ -133,7 +134,15 @@ public class AndroidProvider : IAndroidProvider
 			{
 				Category = "android",
 				Name = "SDK Manager",
-				Status = CheckStatus.Ok
+				Status = CheckStatus.Ok,
+				Message = commandLineTools.Revision is { Length: > 0 } rev
+					? $"command-line tools {rev}"
+					: null,
+				Details = new JsonObject
+				{
+					["path"] = commandLineTools.Path,
+					["revision"] = commandLineTools.Revision
+				}
 			});
 
 			// Check licenses
@@ -476,6 +485,16 @@ public class AndroidProvider : IAndroidProvider
 			onProgress: (phase, pct, msg) => onProgress?.Invoke(phase.ToString(), pct, msg),
 			cancellationToken);
 		_sdkPath = targetPath;
+	}
+
+	public async Task<string?> EnsureLatestSdkToolsAsync(string targetPath,
+		Action<string, int, string>? onProgress = null, CancellationToken cancellationToken = default)
+	{
+		var tool = await _sdkManager.EnsureLatestCommandLineToolsAsync(targetPath,
+			onProgress: (phase, pct, msg) => onProgress?.Invoke(phase.ToString(), pct, msg),
+			cancellationToken);
+		_sdkPath = targetPath;
+		return tool.Revision;
 	}
 
 	public void OverrideSdkPath(string path)

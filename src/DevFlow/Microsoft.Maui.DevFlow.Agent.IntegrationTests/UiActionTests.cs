@@ -841,6 +841,10 @@ public class UiActionTests : IntegrationTestBase
     // Each status label names the drawn item the app resolved, so these assert the tap landed
     // where it was aimed — not only that it was accepted.
 
+    // The Canvas Taps and Drag and Drop pages are built only by the DevFlow.Sample head;
+    // the macOS AppKit, GTK and WPF heads link its shell without them.
+    private bool HasTouchTestPages => Platform is not ("macos" or "gtk" or "wpf");
+
     private async Task<ElementInfo> FindCanvasTargetAsync(string automationId)
     {
         await NavigateToPageAsync("//canvastaps", "SkiaCanvas");
@@ -860,6 +864,7 @@ public class UiActionTests : IntegrationTestBase
             target.RegistryGeneration);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Theory]
     [InlineData(0.8, "right")]
     [InlineData(0.2, "left")]
@@ -887,6 +892,7 @@ public class UiActionTests : IntegrationTestBase
         Assert.InRange(double.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture), canvas.Bounds.Height / 2 - 1, canvas.Bounds.Height / 2 + 1);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task TapAtPoint_OnSyncfusionChart_SelectsEachColumnItIsAimedAt()
     {
@@ -912,9 +918,16 @@ public class UiActionTests : IntegrationTestBase
         }
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task TapAtPoint_OutsideTheElement_IsRejectedWithoutTapping()
     {
+        if (!HasTouchTestPages)
+        {
+            Output.WriteLine($"The {Platform} sample has no canvas or drag page.");
+            return;
+        }
+
         var canvas = await FindCanvasTargetAsync("SkiaCanvas");
         var before = (await FindElementAsync("SkiaStatusLabel")).Text;
 
@@ -928,9 +941,16 @@ public class UiActionTests : IntegrationTestBase
         Assert.Equal(before, status.Text);
     }
 
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Fact]
     public async Task TapAtPoint_WithOnlyOneCoordinate_IsRejected()
     {
+        if (!HasTouchTestPages)
+        {
+            Output.WriteLine($"The {Platform} sample has no canvas or drag page.");
+            return;
+        }
+
         var canvas = await FindCanvasTargetAsync("SkiaCanvas");
 
         using var response = await PostRawAsync("/api/v1/ui/actions/tap", new { elementId = canvas.Id, x = 10 });
@@ -1066,6 +1086,12 @@ public class UiActionTests : IntegrationTestBase
     [Fact]
     public async Task DragFromPoint_OntoATargetFromAnotherCapture_IsRejectedAsStale()
     {
+        if (!HasTouchTestPages)
+        {
+            Output.WriteLine($"The {Platform} sample has no canvas or drag page.");
+            return;
+        }
+
         var card = await OpenDragPageAsync("DragCard");
         var zone = await FindElementAsync("DropZone");
         Assert.NotEqual(card.CaptureEpoch, zone.CaptureEpoch);
@@ -1104,6 +1130,12 @@ public class UiActionTests : IntegrationTestBase
     [Fact]
     public async Task DragFromPoint_StartingOutsideTheElement_IsRejectedWithoutTouching()
     {
+        if (!HasTouchTestPages)
+        {
+            Output.WriteLine($"The {Platform} sample has no canvas or drag page.");
+            return;
+        }
+
         var track = await OpenDragPageAsync("DragSliderTrack");
         var before = (await FindElementAsync("DragSliderStatus")).Text;
 
@@ -1121,6 +1153,12 @@ public class UiActionTests : IntegrationTestBase
     [Fact]
     public async Task DragFromPoint_WithNoEnd_IsRejected()
     {
+        if (!HasTouchTestPages)
+        {
+            Output.WriteLine($"The {Platform} sample has no canvas or drag page.");
+            return;
+        }
+
         var track = await OpenDragPageAsync("DragSliderTrack");
 
         using var response = await PostRawAsync(

@@ -213,6 +213,61 @@ public partial class PlatformAgentService
     }
 
     /// <summary>
+    /// The view a finger at <paramref name="point"/> (in <paramref name="target"/>'s pixels) would
+    /// press instead of the target, or null when the touch reaches the target. Android offers a
+    /// down to the topmost child under it first and moves on only when that child does not take
+    /// it, so a clickable view drawn over the target takes the touch while a label or a bare
+    /// layout lets it through. A view that takes touches only through a listener is not seen.
+    /// </summary>
+    private static global::Android.Views.View? FindTouchBlocker(global::Android.Views.View target, PointF point)
+    {
+        if (target.RootView is not { } root)
+            return null;
+
+        var location = new int[2];
+        target.GetLocationOnScreen(location);
+        float screenX = location[0] + point.X, screenY = location[1] + point.Y;
+        global::Android.Views.View? blocker = null;
+
+        bool Contains(global::Android.Views.View view)
+        {
+            view.GetLocationOnScreen(location);
+            return screenX >= location[0] && screenY >= location[1]
+                && screenX < location[0] + view.Width && screenY < location[1] + view.Height;
+        }
+
+        // true: the target is offered the touch first; false: another view takes it; null: nothing here does.
+        bool? Offer(global::Android.Views.View view)
+        {
+            if (ReferenceEquals(view, target))
+                return true;
+
+            if (view is ViewGroup group)
+            {
+                // Android's dispatch order: highest Z first, then the last drawn.
+                var children = Enumerable.Range(0, group.ChildCount)
+                    .Select(i => (Child: group.GetChildAt(i), Index: i))
+                    .Where(c => c.Child is { Visibility: ViewStates.Visible } && Contains(c.Child))
+                    .OrderByDescending(c => c.Child!.Elevation + c.Child.TranslationZ)
+                    .ThenByDescending(c => c.Index);
+                foreach (var candidate in children)
+                {
+                    if (Offer(candidate.Child!) is { } taken)
+                        return taken;
+                }
+            }
+
+            if (!view.Clickable && !view.LongClickable)
+                return null;
+
+            blocker = view;
+            return false;
+        }
+
+        return Offer(root) == false ? blocker : null;
+    }
+
+    /// <summary>
     /// Dispatches a full touch sequence (down → moves → up) to <paramref name="targetView"/>.
     /// <paramref name="positionsAt"/> is sampled with t in 0..1 and must return one point per
     /// pointer, in the target's own pixels, each inside the target.
@@ -433,6 +488,10 @@ public partial class PlatformAgentService
         if (surface.FromViewOrigin(point.X, point.Y) is not { } at)
             return PointTouchResult.Failed(
                 $"Point ({point.X:0.#}, {point.Y:0.#}) is not in the visible part of {element.GetType().Name}");
+        // The tap is dispatched to the view itself, so it would reach it even through a cover.
+        if (FindTouchBlocker(view, at) is { } cover)
+            return PointTouchResult.Failed(
+                $"Point ({point.X:0.#}, {point.Y:0.#}) on {element.GetType().Name} is covered by {cover.GetType().Name}");
 
         // Held briefly, as a finger is; a zero-length press reads as noise to some detectors.
         var handled = await InjectAndroidTouchAsync(view, 1, _ => [at], 0, 0, holdMs: 50);
@@ -458,6 +517,11 @@ public partial class PlatformAgentService
         if (surface.FromViewOrigin(from.X, from.Y) is not { } start)
             return PointTouchResult.Failed(
                 $"Start point ({from.X:0.#}, {from.Y:0.#}) is not in the visible part of {element.GetType().Name}");
+        // Only the down is checked: once a view holds it, later moves are its own, and an
+        // ancestor may still take them over as it would from a finger.
+        if (FindTouchBlocker(view, start) is { } cover)
+            return PointTouchResult.Failed(
+                $"Start point ({from.X:0.#}, {from.Y:0.#}) on {element.GetType().Name} is covered by {cover.GetType().Name}");
 
         var root = view.RootView;
         if (root == null)
@@ -482,8 +546,12 @@ public partial class PlatformAgentService
                 return PointTouchResult.Failed(
                     $"End point ({to.X:0.#}, {to.Y:0.#}) is not in the visible part of the drop target {endElement.GetType().Name}");
 
-            endView = targetView;
             end = new PointF(tx, ty);
+            if (FindTouchBlocker(targetView, end) is { } targetCover)
+                return PointTouchResult.Failed(
+                    $"End point ({to.X:0.#}, {to.Y:0.#}) on the drop target {endElement.GetType().Name} is covered by {targetCover.GetType().Name}");
+
+            endView = targetView;
         }
 
         var origin = new int[2];
@@ -1100,6 +1168,21 @@ public partial class PlatformAgentService
         if (hit == null || !(ReferenceEquals(hit, view) || hit.IsDescendantOfView(view)))
             return PointTouchResult.Failed(
                 $"Start point ({from.X:0.#}, {from.Y:0.#}) on {element.GetType().Name} is covered by {hit?.GetType().Name ?? "nothing"}");
+
+        // A drop target must be where a finger can release on it: on screen and uncovered. An end
+        // on the element itself may lie past its edge, so only a separate target is checked.
+        if (!ReferenceEquals(endView, view))
+        {
+            var targetName = $"the drop target {endElement.GetType().Name}";
+            if (!window.Bounds.Contains(end))
+                return PointTouchResult.Failed($"End point ({to.X:0.#}, {to.Y:0.#}) on {targetName} is off screen");
+
+            // Hidden and scrolled-out targets hit-test to something else, as covered ones do.
+            var endHit = window.HitTest(end, null);
+            if (endHit == null || !(ReferenceEquals(endHit, endView) || endHit.IsDescendantOfView(endView)))
+                return PointTouchResult.Failed(
+                    $"End point ({to.X:0.#}, {to.Y:0.#}) on {targetName} is hidden or covered by {endHit?.GetType().Name ?? "nothing"}");
+        }
 
         // Controls and scroll views track touches themselves and are not handed synthetic ones;
         // see AppleRawTouchPolicy.

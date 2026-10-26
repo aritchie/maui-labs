@@ -103,13 +103,49 @@ internal sealed class NativeUiOperations(AgentClient client)
             scale, rotation, deltaX, deltaY, originX, originY, steps, epoch, generation);
     }
 
-    internal Task<GestureResult> DragAsync(
+    internal async Task<GestureResult> DragAsync(
         ElementInfo element, double x, double y, double? toX, double? toY, string? toElementId,
         int? holdMs, int? durationMs, int? steps)
     {
+        if (toElementId != null)
+        {
+            // The agent validates the drop target against the same capture as the dragged
+            // element, and the source was resolved by a query that never saw the target. One
+            // tree capture holds both, so the pair is current together or rejected together.
+            var tree = Flatten(await client.GetTreeAsync(0, null));
+            var source = tree.FirstOrDefault(e => string.Equals(e.Id, element.Id, StringComparison.Ordinal));
+            var target = tree.FirstOrDefault(e => string.Equals(e.Id, toElementId, StringComparison.Ordinal));
+            if (source is null || target is null)
+            {
+                return new GestureResult
+                {
+                    Type = "drag",
+                    ElementId = element.Id,
+                    Error = $"{(source is null ? element.Id : toElementId)} is not in the current visual tree.",
+                };
+            }
+
+            element = source;
+        }
+
         var (epoch, generation) = GetCaptureMetadata(element);
 
-        return client.DragAsync(element.Id, x, y, toX, toY, toElementId, holdMs, durationMs, steps, epoch, generation);
+        return await client.DragAsync(element.Id, x, y, toX, toY, toElementId, holdMs, durationMs, steps, epoch, generation);
+    }
+
+    private static List<ElementInfo> Flatten(IEnumerable<ElementInfo> roots)
+    {
+        var all = new List<ElementInfo>();
+        var pending = new Stack<ElementInfo>(roots);
+        while (pending.Count > 0)
+        {
+            var element = pending.Pop();
+            all.Add(element);
+            foreach (var child in element.Children ?? [])
+                pending.Push(child);
+        }
+
+        return all;
     }
 
     internal async Task<(List<ElementInfo> Elements, bool TimedOut)> QueryAsync(

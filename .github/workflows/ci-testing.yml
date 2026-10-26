@@ -29,7 +29,9 @@ jobs:
       Configuration: Release
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
+        # The .NET 11 iOS/Mac Catalyst packs the template restores need Xcode 27, which
+        # macos-latest does not have yet.
+        os: [xcode-27, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:

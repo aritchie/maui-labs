@@ -768,7 +768,9 @@ paths:
         view; on iOS and Mac Catalyst it is a synthesised UITouch given to the gesture recognizers
         of the view under the point (or, for a recognizer-less raw-touch view, to the view), which
         needs AgentOptions.EnableSyntheticTouch (capabilities.syntheticTouch). A point outside the
-        element, or covered by another view, is rejected rather than tapped elsewhere.
+        element, or covered by another view, is rejected rather than tapped elsewhere. On Android
+        any view over the point that may take touches counts as covering it — including one that
+        takes them only through a touch listener, such as another canvas.
       requestBody:
         required: true
         content:
@@ -1034,8 +1036,11 @@ paths:
         tap does not fire. Android sends the MotionEvents through the window, so an enclosing
         scroller can take the drag exactly as it would a finger's; iOS and Mac Catalyst feed a
         synthesised UITouch to the recognizers under the point and need
-        capabilities.syntheticTouch. A start point off the element is rejected, and the element
-        is scrolled into view first.
+        capabilities.syntheticTouch. Because only the element's own recognizers see that touch,
+        iOS and Mac Catalyst refuse a drag that a recognizer outside them would contest — an
+        enclosing scroll view scrolling along the drag's axis, or an ancestor's pan, swipe or long
+        press — instead of reporting a drag a finger might not have made. A start point off the
+        element is rejected, and the element is scrolled into view first.
       requestBody:
         required: true
         content:

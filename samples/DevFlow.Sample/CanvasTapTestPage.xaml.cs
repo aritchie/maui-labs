@@ -16,6 +16,7 @@ public partial class CanvasTapTestPage : ContentPage
 
     private int _skiaTaps;
     private int _chartSelections;
+    private int _overlayTouches;
 
     public CanvasTapTestPage()
     {
@@ -50,6 +51,31 @@ public partial class CanvasTapTestPage : ContentPage
         SkiaStatusLabel.Text =
             $"skia: {half} at ({e.Location.X / scale:0}, {e.Location.Y / scale:0}) taps={_skiaTaps}";
     }
+
+    private void OnOverlayPaintSurface(object? sender, SKPaintSurfaceEventArgs e)
+    {
+        var canvas = e.Surface.Canvas;
+        canvas.Clear(new SKColor(0x1C, 0x1B, 0x1F, 0x99));
+    }
+
+    private void OnOverlayTouch(object? sender, SKTouchEventArgs e)
+    {
+        e.Handled = true;
+        if (e.ActionType == SKTouchAction.Released)
+            _overlayTouches++;
+        ShowOverlayStatus();
+    }
+
+    private void OnOverlayToggleClicked(object? sender, EventArgs e)
+    {
+        SkiaOverlay.IsVisible = !SkiaOverlay.IsVisible;
+        _overlayTouches = 0;
+        ShowOverlayStatus();
+    }
+
+    private void ShowOverlayStatus() =>
+        SkiaOverlayStatusLabel.Text =
+            $"overlay: {(SkiaOverlay.IsVisible ? "shown" : "hidden")} touches={_overlayTouches}";
 
     private void OnChartSelectionChanged(object? sender, ChartSelectionChangedEventArgs e)
     {

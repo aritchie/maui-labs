@@ -959,6 +959,69 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("x and y must be given together", await response.Content.ReadAsStringAsync());
     }
 
+    // The overlay is a second SKCanvasView over SkiaCanvas. It takes touches only through a
+    // listener (Android) or a recognizer (iOS) and is neither clickable nor a control, so nothing
+    // on the view itself says it would take a finger's touch — but it would.
+    private async Task SetSkiaOverlayAsync(bool shown)
+    {
+        var state = shown ? "overlay: shown" : "overlay: hidden";
+        await WaitForAsync(async () =>
+        {
+            if ((await FindElementAsync("SkiaOverlayStatus")).Text?.StartsWith(state, StringComparison.Ordinal) == true)
+                return true;
+            var toggle = await FindElementAsync("SkiaOverlayToggle");
+            await Client.TapAsync(toggle.Id, toggle.CaptureEpoch, toggle.RegistryGeneration);
+            await SettleAsync();
+            return (await FindElementAsync("SkiaOverlayStatus")).Text?.StartsWith(state, StringComparison.Ordinal) == true;
+        });
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Theory]
+    [InlineData("tap")]
+    [InlineData("drag")]
+    public async Task PointTouch_OnACanvasUnderAListenerOnlyOverlay_IsRefusedWithoutTouching(string kind)
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Touch injection is not available on {Platform}.");
+            return;
+        }
+
+        await FindCanvasTargetAsync("SkiaCanvas");
+        await SetSkiaOverlayAsync(shown: true);
+        try
+        {
+            var canvas = await FindElementAsync("SkiaCanvas");
+            var before = (await FindElementAsync("SkiaStatusLabel")).Text;
+            var bounds = canvas.Bounds!;
+
+            (bool Success, string? Error) result;
+            if (kind == "tap")
+            {
+                var tap = await TapAtFractionAsync(canvas, 0.5, 0.5);
+                result = (tap.Success, tap.Error);
+            }
+            else
+            {
+                var drag = await Client.DragAsync(
+                    canvas.Id, bounds.Width / 4, bounds.Height / 2, toX: bounds.Width * 3 / 4, toY: bounds.Height / 2,
+                    captureEpoch: canvas.CaptureEpoch, registryGeneration: canvas.RegistryGeneration);
+                result = (drag.Success, drag.Error);
+            }
+
+            Assert.False(result.Success, $"The {kind} was reported delivered through the overlay");
+            Assert.Contains("covered by", result.Error);
+            await SettleAsync();
+            Assert.Equal(before, (await FindElementAsync("SkiaStatusLabel")).Text);
+            Assert.Equal("overlay: shown touches=0", (await FindElementAsync("SkiaOverlayStatus")).Text);
+        }
+        finally
+        {
+            await SetSkiaOverlayAsync(shown: false);
+        }
+    }
+
     // ========== drag from a point: real touches along a path ==========
     // The Drag and Drop page's slider and card move only for what MAUI's pan and tap
     // recognizers receive from the platform, and each status label counts it. A drag driven
@@ -1117,13 +1180,42 @@ public class UiActionTests : IntegrationTestBase
         var target = await FindRawTouchTargetAsync();
         var bounds = target.Bounds!;
 
+        // Leftwards: on iOS the canvas's host carries a right-swipe recognizer, which a finger
+        // dragged to the right would trigger (see the next test).
         var result = await Client.DragAsync(
-            target.Id, bounds.Width / 4, bounds.Height / 2, toX: bounds.Width / 4 + 80, toY: bounds.Height / 2,
+            target.Id, bounds.Width * 3 / 4, bounds.Height / 2, toX: bounds.Width * 3 / 4 - 80, toY: bounds.Height / 2,
             captureEpoch: target.CaptureEpoch, registryGeneration: target.RegistryGeneration);
 
         Assert.True(result.Success, result.Error);
         await SettleAsync();
-        Assert.Contains("dx=80", (await FindElementAsync("RawTouchStatusLabel")).Text);
+        Assert.Contains("dx=-80", (await FindElementAsync("RawTouchStatusLabel")).Text);
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task DragFromPoint_TheWayAnAncestorSwipes_IsRefusedOnUIKit()
+    {
+        if (!Platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+            && !Platform.Equals("maccatalyst", StringComparison.OrdinalIgnoreCase))
+        {
+            Output.WriteLine($"The ancestor swipe recognizer is a UIKit fixture; {Platform} has none.");
+            return;
+        }
+
+        var target = await FindRawTouchTargetAsync();
+        var bounds = target.Bounds!;
+        var before = (await FindElementAsync("RawTouchStatusLabel")).Text;
+
+        // A finger dragged right here would be taken by the host's swipe, which cancels the
+        // canvas's touches; synthetic touches cannot play that out, so nothing is sent.
+        var result = await Client.DragAsync(
+            target.Id, bounds.Width / 4, bounds.Height / 2, toX: bounds.Width / 4 + 80, toY: bounds.Height / 2,
+            captureEpoch: target.CaptureEpoch, registryGeneration: target.RegistryGeneration);
+
+        Assert.False(result.Success, "A drag the ancestor swipe would take was reported delivered");
+        Assert.Contains("UISwipeGestureRecognizer", result.Error);
+        await SettleAsync();
+        Assert.Equal(before, (await FindElementAsync("RawTouchStatusLabel")).Text);
     }
 
     [Trait(TestFramework.Trait, TestFramework.Maui)]
@@ -1166,6 +1258,48 @@ public class UiActionTests : IntegrationTestBase
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Contains("needs an end", await response.Content.ReadAsStringAsync());
+    }
+
+    [Trait(TestFramework.Trait, TestFramework.Maui)]
+    [Fact]
+    public async Task DragFromPoint_AlongTheEnclosingScroller_IsNotReportedAsTheElementsDrag()
+    {
+        if (!SupportsRawTouchInjection)
+        {
+            Output.WriteLine($"Touch injection is not available on {Platform}.");
+            return;
+        }
+
+        // The page's ScrollView scrolls vertically, so a finger dragged up the slider is a
+        // contest between the slider's pan and the scroller's. (Up, because the page starts at its top.)
+        var track = await OpenDragPageAsync("DragSliderTrack");
+        var bounds = track.Bounds!;
+
+        var result = await Client.DragAsync(
+            track.Id, 12, bounds.Height / 2, toX: 12, toY: bounds.Height / 2 - 120,
+            durationMs: 400, steps: 20, captureEpoch: track.CaptureEpoch, registryGeneration: track.RegistryGeneration);
+
+        await SettleAsync();
+        var status = (await FindElementAsync("DragSliderStatus")).Text ?? "";
+        if (Platform.Equals("android", StringComparison.OrdinalIgnoreCase))
+        {
+            // Android dispatches through the window, so the contest is real: the scroller
+            // intercepts the moves and scrolls, and the thumb stays where it was.
+            Assert.True(result.Success, result.Error);
+            Assert.True(
+                (await FindElementAsync("DragSliderTrack")).WindowBounds!.Y < track.WindowBounds!.Y - 50,
+                "The enclosing ScrollView did not take the vertical drag");
+        }
+        else
+        {
+            // UIKit's arbitration with the scroller cannot be reproduced, so nothing is sent.
+            Assert.False(result.Success, "A drag the scroller would contest was reported delivered");
+            Assert.Contains("cannot reproduce that contest", result.Error);
+            Assert.Equal("slider: value=0 pans=0 taps=0 commits=0", status);
+        }
+
+        Assert.StartsWith("slider: value=0 ", status);
+        Assert.Contains(" taps=0 ", status);
     }
 
     [Trait(TestFramework.Trait, TestFramework.Maui)]

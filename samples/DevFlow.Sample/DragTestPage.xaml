@@ -95,6 +95,10 @@
                 </VerticalStackLayout>
             </Border>
 
+            <!-- Room to scroll on any screen, so the ScrollView above always competes for a
+                 vertical drag. -->
+            <BoxView HeightRequest="1200" Color="Transparent" InputTransparent="True" />
+
         </VerticalStackLayout>
     </ScrollView>
 </ContentPage>

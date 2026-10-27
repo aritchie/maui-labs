@@ -513,6 +513,31 @@ internal static class AppleTouchInjector
     [return: MarshalAs(UnmanagedType.I1)]
     private static extern bool SendBool(IntPtr receiver, IntPtr selector, IntPtr arg1, IntPtr arg2);
 
+    private static bool DelegateAccepts(UIGestureRecognizer recognizer, UITouch touch)
+    {
+        var selector = new Selector("gestureRecognizer:shouldReceiveTouch:");
+        var recognizerDelegate = recognizer.WeakDelegate;
+        return recognizerDelegate == null
+            || !recognizerDelegate.RespondsToSelector(selector)
+            || SendBool((IntPtr)recognizerDelegate.Handle, selector.Handle, (IntPtr)recognizer.Handle, (IntPtr)touch.Handle);
+    }
+
+    /// <summary>
+    /// Those of <paramref name="recognizers"/> whose delegates would accept a touch starting at
+    /// <paramref name="locationInWindow"/> on <paramref name="target"/> — asked exactly as
+    /// <see cref="DriveRecognizersAsync"/> asks them, without delivering anything. Null when the
+    /// touch cannot be assembled on this OS version.
+    /// </summary>
+    internal static List<UIGestureRecognizer>? WouldReceive(
+        UIView target, IEnumerable<UIGestureRecognizer> recognizers, CGPoint locationInWindow)
+    {
+        if (target.Window is not { } window)
+            return null;
+
+        using var touch = AppleSyntheticTouch.Create(window, target, locationInWindow);
+        return touch == null ? null : recognizers.Where(r => DelegateAccepts(r, touch.Touch)).ToList();
+    }
+
     /// <summary>
     /// One touch delivered to gesture recognizers rather than to a view — a tap when
     /// <paramref name="steps"/> is 0, otherwise a drag along <paramref name="positionAt"/> (sampled
@@ -546,23 +571,12 @@ internal static class AppleTouchInjector
 
         using var set = new NSSet(touch.Touch);
         using var touchEvent = new SyntheticTouchEvent(set);
-        var shouldReceive = (IntPtr)Selector.GetHandle("gestureRecognizer:shouldReceiveTouch:");
-        var receiving = new List<UIGestureRecognizer>(recognizers.Count);
 
         try
         {
-            foreach (var recognizer in recognizers)
-            {
-                // A delegate that declines the touch keeps the recognizer out of it, as it would
-                // for a real finger — Syncfusion's scroll recognizer filters touches this way.
-                var recognizerDelegate = recognizer.WeakDelegate;
-                if (recognizerDelegate != null
-                    && recognizerDelegate.RespondsToSelector(new Selector("gestureRecognizer:shouldReceiveTouch:"))
-                    && !SendBool((IntPtr)recognizerDelegate.Handle, shouldReceive, (IntPtr)recognizer.Handle, (IntPtr)touch.Touch.Handle))
-                    continue;
-
-                receiving.Add(recognizer);
-            }
+            // A delegate that declines the touch keeps the recognizer out of it, as it would
+            // for a real finger — Syncfusion's scroll recognizer filters touches this way.
+            var receiving = recognizers.Where(r => DelegateAccepts(r, touch.Touch)).ToList();
 
             foreach (var recognizer in receiving)
                 recognizer.TouchesBegan(set, touchEvent);

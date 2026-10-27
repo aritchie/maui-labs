@@ -29,16 +29,38 @@
                 <VerticalStackLayout Spacing="8">
                     <Label Text="SkiaSharp canvas (SKCanvasView)" FontAttributes="Bold" FontSize="16" />
                     <Label Text="Left half is red, right half is blue." FontSize="12" />
-                    <skia:SKCanvasView x:Name="SkiaCanvas"
-                                       AutomationId="SkiaCanvas"
-                                       HeightRequest="120"
-                                       EnableTouchEvents="True"
-                                       PaintSurface="OnSkiaPaintSurface"
-                                       Touch="OnSkiaTouch" />
+                    <Grid>
+                        <skia:SKCanvasView x:Name="SkiaCanvas"
+                                           AutomationId="SkiaCanvas"
+                                           HeightRequest="120"
+                                           EnableTouchEvents="True"
+                                           PaintSurface="OnSkiaPaintSurface"
+                                           Touch="OnSkiaTouch" />
+                        <!-- A second canvas drawn over the first. It takes touches only through a
+                             listener (Android) or recognizer (iOS) and is neither clickable nor a
+                             control, so a touch aimed at the canvas beneath must be refused, not
+                             delivered through it. -->
+                        <skia:SKCanvasView x:Name="SkiaOverlay"
+                                           AutomationId="SkiaOverlay"
+                                           IsVisible="False"
+                                           EnableTouchEvents="True"
+                                           PaintSurface="OnOverlayPaintSurface"
+                                           Touch="OnOverlayTouch" />
+                    </Grid>
                     <Label x:Name="SkiaStatusLabel"
                            Text="skia: none"
                            FontSize="14"
                            AutomationId="SkiaStatusLabel" />
+                    <HorizontalStackLayout Spacing="8">
+                        <Button Text="Toggle overlay"
+                                AutomationId="SkiaOverlayToggle"
+                                Clicked="OnOverlayToggleClicked" />
+                        <Label x:Name="SkiaOverlayStatusLabel"
+                               Text="overlay: hidden touches=0"
+                               FontSize="14"
+                               VerticalOptions="Center"
+                               AutomationId="SkiaOverlayStatus" />
+                    </HorizontalStackLayout>
                 </VerticalStackLayout>
             </Border>
 

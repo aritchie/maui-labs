@@ -207,7 +207,14 @@ Syncfusion's charts and other Microsoft.Maui.Graphics controls — which has no 
 (`HandlePointTapAsync`) validates the point against the element's bounds and never falls back to
 the element tap; platforms override `TryNativePointTapAsync`.
    - **Android** — a `MotionEvent` down/up at the point, sent to the element's view like the
-     gestures above; the point must be in the view's visible rect.
+     gestures above; the point must be in the view's visible rect, and not covered
+     (`FindTouchBlocker`, shared with point drags). Android offers a down to the topmost view
+     first, and whether a view keeps it cannot be read back — an `OnTouchListener` (SkiaSharp's
+     canvas, MAUI's gesture recognizers) is invisible — so the check fails closed: a view drawn
+     over the target lets the touch through only when it is not clickable, its exact type is one
+     of MAUI's plain platform views (layouts, `ContentViewGroup`, `WrapperView`, Label, Image,
+     BoxView) or the framework base they use, and no MAUI gesture recognizer is attached to it.
+     Anything else over the point refuses the touch.
    - **iOS / Mac Catalyst** — requires `EnableSyntheticTouch`. The element is scrolled into view
      through its enclosing scroll views, then the window hit-tests the point,
      which must land on the element or inside it (controls and scroll views are refused — tap them
@@ -244,6 +251,14 @@ against the element's bounds and the end against a drop target's; it never falls
      `setState:Failed` mid-touch is deferred by UIKit, and the tap would still fire at touch end.
      The touch's `_preciseLocationInWindow` is moved with `_locationInWindow`. MAUI's pan
      translation starts after UIKit's 10pt slop, as it does for a finger.
+     Only the element's own recognizers are driven, so a drag a recognizer outside them would
+     contest is refused before any touch is sent (`FindCompetingRecognizer`): an enclosing scroll
+     view that scrolls along an axis the drag travels more than 10pt on, or — above the element —
+     a pan, a swipe in a direction the drag travels, a long press the hold outlasts, or an unknown
+     recognizer, after its delegate's `shouldReceiveTouch:` (Shell's flyout pan declines touches
+     away from the leading edge). Taps, hover, screen-edge and multi-finger recognizers, and a
+     scroll view's private machinery, are not contenders. Modelling UIKit's arbitration with those
+     recognizers is future work; until then the refusal says which recognizer was in the way.
    - MAUI's `DragGestureRecognizer`/`DropGestureRecognizer` are out of scope: the platforms run
      them as system drag sessions (`UIDragInteraction`, `View.startDragAndDrop`) that this tier
      does not feed, and MAUI exposes only `DropGestureRecognizer.SendDragOver` publicly.

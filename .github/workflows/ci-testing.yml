@@ -37,6 +37,7 @@ jobs:
       XCODE_VERSION: '27.0'
     strategy:
       matrix:
+        # This image includes the pinned Xcode 27.0 selected below.
         os: [xcode-27, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:

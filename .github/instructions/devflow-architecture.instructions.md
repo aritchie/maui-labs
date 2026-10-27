@@ -209,11 +209,13 @@ the element tap; platforms override `TryNativePointTapAsync`.
    - **Android** — a `MotionEvent` down/up at the point, sent to the element's view like the
      gestures above; the point must be in the view's visible rect, and not covered
      (`FindTouchBlocker`, shared with point drags). Android offers a down to the topmost view
-     first, and whether a view keeps it cannot be read back — an `OnTouchListener` (SkiaSharp's
-     canvas, MAUI's gesture recognizers) is invisible — so the check fails closed: a view drawn
-     over the target lets the touch through only when it is not clickable, its exact type is one
-     of MAUI's plain platform views (layouts, `ContentViewGroup`, `WrapperView`, Label, Image,
-     BoxView) or the framework base they use, and no MAUI gesture recognizer is attached to it.
+     first, and whether a view keeps it cannot be read back in general — an `onTouchEvent`
+     override or an `OnTouchListener` (SkiaSharp's canvas, MAUI's gesture recognizers, one the app
+     attached natively) can keep it — so the check fails closed: a view drawn over the target lets
+     the touch through only when it is not clickable, its exact type is one of MAUI's plain
+     platform views (layouts, `ContentViewGroup`, `WrapperView`, Label, Image, BoxView) or the
+     framework base they use, no MAUI gesture recognizer is attached to it, and it has no touch
+     listener (read from the private `View.mListenerInfo`; unreadable counts as having one).
      Anything else over the point refuses the touch.
    - **iOS / Mac Catalyst** — requires `EnableSyntheticTouch`. The element is scrolled into view
      through its enclosing scroll views, then the window hit-tests the point,

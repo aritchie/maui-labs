@@ -17,11 +17,21 @@ public partial class CanvasTapTestPage : ContentPage
     private int _skiaTaps;
     private int _chartSelections;
     private int _overlayTouches;
+    private int _listenerOverlayTouches;
 
     public CanvasTapTestPage()
     {
         InitializeComponent();
         SalesSeries.ItemsSource = Sales;
+#if ANDROID
+        ListenerOverlay.HandlerChanged += (_, _) =>
+            (ListenerOverlay.Handler?.PlatformView as Android.Views.View)?.SetOnTouchListener(
+                new KeepingTouchListener(() =>
+                {
+                    _listenerOverlayTouches++;
+                    ShowListenerOverlayStatus();
+                }));
+#endif
     }
 
     private void OnSkiaPaintSurface(object? sender, SKPaintSurfaceEventArgs e)
@@ -77,6 +87,17 @@ public partial class CanvasTapTestPage : ContentPage
         SkiaOverlayStatusLabel.Text =
             $"overlay: {(SkiaOverlay.IsVisible ? "shown" : "hidden")} touches={_overlayTouches}";
 
+    private void OnListenerOverlayToggleClicked(object? sender, EventArgs e)
+    {
+        ListenerOverlay.IsVisible = !ListenerOverlay.IsVisible;
+        _listenerOverlayTouches = 0;
+        ShowListenerOverlayStatus();
+    }
+
+    private void ShowListenerOverlayStatus() =>
+        ListenerOverlayStatusLabel.Text =
+            $"label overlay: {(ListenerOverlay.IsVisible ? "shown" : "hidden")} touches={_listenerOverlayTouches}";
+
     private void OnChartSelectionChanged(object? sender, ChartSelectionChangedEventArgs e)
     {
         _chartSelections++;
@@ -85,4 +106,17 @@ public partial class CanvasTapTestPage : ContentPage
     }
 
     private sealed record SalesPoint(string Name, double Value);
+
+#if ANDROID
+    /// <summary>Keeps every touch it is offered and counts each one that ends.</summary>
+    private sealed class KeepingTouchListener(Action released) : Java.Lang.Object, Android.Views.View.IOnTouchListener
+    {
+        public bool OnTouch(Android.Views.View? v, Android.Views.MotionEvent? e)
+        {
+            if (e?.ActionMasked == Android.Views.MotionEventActions.Up)
+                released();
+            return true;
+        }
+    }
+#endif
 }

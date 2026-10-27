@@ -46,6 +46,13 @@
                                            EnableTouchEvents="True"
                                            PaintSurface="OnOverlayPaintSurface"
                                            Touch="OnOverlayTouch" />
+                        <!-- A plain label over the canvas. On Android the app gives it a native
+                             touch listener that keeps every down, with no MAUI gesture recognizer,
+                             so only the listener tells it apart from a label a touch passes. -->
+                        <Label x:Name="ListenerOverlay"
+                               AutomationId="ListenerOverlay"
+                               IsVisible="False"
+                               BackgroundColor="#661C1B1F" />
                     </Grid>
                     <Label x:Name="SkiaStatusLabel"
                            Text="skia: none"
@@ -60,6 +67,16 @@
                                FontSize="14"
                                VerticalOptions="Center"
                                AutomationId="SkiaOverlayStatus" />
+                    </HorizontalStackLayout>
+                    <HorizontalStackLayout Spacing="8">
+                        <Button Text="Toggle label overlay"
+                                AutomationId="ListenerOverlayToggle"
+                                Clicked="OnListenerOverlayToggleClicked" />
+                        <Label x:Name="ListenerOverlayStatusLabel"
+                               Text="label overlay: hidden touches=0"
+                               FontSize="14"
+                               VerticalOptions="Center"
+                               AutomationId="ListenerOverlayStatus" />
                     </HorizontalStackLayout>
                 </VerticalStackLayout>
             </Border>

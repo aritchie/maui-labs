@@ -959,28 +959,40 @@ public class UiActionTests : IntegrationTestBase
         Assert.Contains("x and y must be given together", await response.Content.ReadAsStringAsync());
     }
 
-    // The overlay is a second SKCanvasView over SkiaCanvas. It takes touches only through a
-    // listener (Android) or a recognizer (iOS) and is neither clickable nor a control, so nothing
-    // on the view itself says it would take a finger's touch — but it would.
-    private async Task SetSkiaOverlayAsync(bool shown)
+    // Two overlays can cover SkiaCanvas, each with a toggle and a "<prefix>: shown|hidden
+    // touches=N" status. "SkiaOverlay" is a second SKCanvasView: it takes touches only through a
+    // listener (Android) or a recognizer (iOS) and is neither clickable nor a control. "Listener"
+    // is a plain Label — a type a touch normally passes — that the app gives a native touch
+    // listener on Android, with no MAUI gesture recognizer. Nothing on either view says it would
+    // take a finger's touch, but both would.
+    private static (string Toggle, string Status, string Prefix) OverlayIds(string overlay) => overlay switch
     {
-        var state = shown ? "overlay: shown" : "overlay: hidden";
+        "SkiaOverlay" => ("SkiaOverlayToggle", "SkiaOverlayStatus", "overlay"),
+        _ => ("ListenerOverlayToggle", "ListenerOverlayStatus", "label overlay"),
+    };
+
+    private async Task SetOverlayAsync(string overlay, bool shown)
+    {
+        var (toggleId, statusId, prefix) = OverlayIds(overlay);
+        var state = $"{prefix}: {(shown ? "shown" : "hidden")}";
         await WaitForAsync(async () =>
         {
-            if ((await FindElementAsync("SkiaOverlayStatus")).Text?.StartsWith(state, StringComparison.Ordinal) == true)
+            if ((await FindElementAsync(statusId)).Text?.StartsWith(state, StringComparison.Ordinal) == true)
                 return true;
-            var toggle = await FindElementAsync("SkiaOverlayToggle");
+            var toggle = await FindElementAsync(toggleId);
             await Client.TapAsync(toggle.Id, toggle.CaptureEpoch, toggle.RegistryGeneration);
             await SettleAsync();
-            return (await FindElementAsync("SkiaOverlayStatus")).Text?.StartsWith(state, StringComparison.Ordinal) == true;
+            return (await FindElementAsync(statusId)).Text?.StartsWith(state, StringComparison.Ordinal) == true;
         });
     }
 
     [Trait(TestFramework.Trait, TestFramework.Maui)]
     [Theory]
-    [InlineData("tap")]
-    [InlineData("drag")]
-    public async Task PointTouch_OnACanvasUnderAListenerOnlyOverlay_IsRefusedWithoutTouching(string kind)
+    [InlineData("SkiaOverlay", "tap")]
+    [InlineData("SkiaOverlay", "drag")]
+    [InlineData("ListenerOverlay", "tap")]
+    [InlineData("ListenerOverlay", "drag")]
+    public async Task PointTouch_OnACanvasUnderAListenerOnlyOverlay_IsRefusedWithoutTouching(string overlay, string kind)
     {
         if (!SupportsRawTouchInjection)
         {
@@ -988,8 +1000,17 @@ public class UiActionTests : IntegrationTestBase
             return;
         }
 
+        // The label's listener is attached natively on Android only; elsewhere a label lets a
+        // finger's touch through, as the agent does.
+        if (overlay == "ListenerOverlay" && Platform != "android")
+        {
+            Output.WriteLine($"The label overlay has no touch listener on {Platform}.");
+            return;
+        }
+
+        var (_, statusId, prefix) = OverlayIds(overlay);
         await FindCanvasTargetAsync("SkiaCanvas");
-        await SetSkiaOverlayAsync(shown: true);
+        await SetOverlayAsync(overlay, shown: true);
         try
         {
             var canvas = await FindElementAsync("SkiaCanvas");
@@ -1010,15 +1031,15 @@ public class UiActionTests : IntegrationTestBase
                 result = (drag.Success, drag.Error);
             }
 
-            Assert.False(result.Success, $"The {kind} was reported delivered through the overlay");
+            Assert.False(result.Success, $"The {kind} was reported delivered through {overlay}");
             Assert.Contains("covered by", result.Error);
             await SettleAsync();
             Assert.Equal(before, (await FindElementAsync("SkiaStatusLabel")).Text);
-            Assert.Equal("overlay: shown touches=0", (await FindElementAsync("SkiaOverlayStatus")).Text);
+            Assert.Equal($"{prefix}: shown touches=0", (await FindElementAsync(statusId)).Text);
         }
         finally
         {
-            await SetSkiaOverlayAsync(shown: false);
+            await SetOverlayAsync(overlay, shown: false);
         }
     }
 

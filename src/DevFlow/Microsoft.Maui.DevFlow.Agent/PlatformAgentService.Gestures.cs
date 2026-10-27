@@ -295,11 +295,11 @@ public partial class PlatformAgentService
     /// <summary>
     /// Whether a view offered a down is known to pass it on. A view's default
     /// <c>onTouchEvent</c> keeps the down only when it is clickable, long-clickable or
-    /// context-clickable, but a touch listener or an override can keep it too, and neither shows
-    /// from outside. So beyond those flags only the plain views in
-    /// <see cref="PassThroughViewTypes"/> count, and only when MAUI has not attached a gesture
-    /// recognizer's listener to them; a text view that follows links or selects text keeps the
-    /// touch as well.
+    /// context-clickable, but a touch listener or an override can keep it too. An override is
+    /// ruled out by the exact types in <see cref="PassThroughViewTypes"/>; a listener, whether
+    /// MAUI attached it for a gesture recognizer or the app attached it natively, is read from
+    /// the view, and a view whose listener cannot be read keeps the down. A text view that
+    /// follows links or selects text keeps the touch as well.
     /// </summary>
     private static bool LetsDownThrough(global::Android.Views.View view, HashSet<global::Android.Views.View> gestureViews)
     {
@@ -310,8 +310,52 @@ public partial class PlatformAgentService
         if (!PassThroughViewTypes.Contains(view.GetType()) || gestureViews.Contains(view))
             return false;
 
+        if (HasTouchListener(view) != false)
+            return false;
+
         return view is not global::Android.Widget.TextView text
             || (text.MovementMethod == null && !text.IsTextSelectable);
+    }
+
+    private static Java.Lang.Reflect.Field? _listenerInfoField;
+    private static Java.Lang.Reflect.Field? _onTouchListenerField;
+
+    /// <summary>
+    /// Whether <c>setOnTouchListener</c> has given the view a listener, which may keep any down
+    /// it is offered; null when that cannot be read. View has no public getter for it, so it is
+    /// read from the private <c>mListenerInfo.mOnTouchListener</c> that <c>dispatchTouchEvent</c>
+    /// consults. A runtime that hides those fields makes every listener unknown.
+    /// </summary>
+    private static bool? HasTouchListener(global::Android.Views.View view)
+    {
+        try
+        {
+            if (_listenerInfoField == null)
+            {
+                var field = Java.Lang.Class.FromType(typeof(global::Android.Views.View)).GetDeclaredField("mListenerInfo");
+                field.Accessible = true;
+                _listenerInfoField = field;
+            }
+
+            // Not disposed: Field.get hands back the live peers, and the listener can be the
+            // app's own managed object.
+            var info = _listenerInfoField.Get(view);
+            if (info == null)
+                return false;
+
+            if (_onTouchListenerField == null)
+            {
+                var field = info.Class.GetDeclaredField("mOnTouchListener");
+                field.Accessible = true;
+                _onTouchListenerField = field;
+            }
+
+            return _onTouchListenerField.Get(info) != null;
+        }
+        catch (Java.Lang.Exception)
+        {
+            return null;
+        }
     }
 
     /// <summary>

@@ -2,8 +2,9 @@
 
 On-device chat and text embeddings through
 [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/ai-extensions),
-backed by Apple Intelligence and NaturalLanguage. Chat supports streaming,
-structured JSON, native tool execution, and image input on supported systems.
+backed by Apple Intelligence, Apple NaturalLanguage, and Windows AI. Chat
+supports streaming and structured JSON; Apple also supports native tool
+execution and image input on eligible systems.
 No cloud service is used.
 
 > **Experimental:** this package ships as a preview. APIs may change.
@@ -17,7 +18,7 @@ Requires .NET 10 and matching MAUI workloads.
 | iOS | Apple Intelligence, OS 26+ | NaturalLanguage, OS 13+ |
 | Mac Catalyst | Apple Intelligence, OS 26+ | NaturalLanguage, OS 13.1+ |
 | macOS | Apple Intelligence, OS 26+ | NaturalLanguage, OS 10.15+ |
-| Windows | Coming soon; details to be determined | Not supported |
+| Windows | Windows AI on Windows 11 24H2+ and supported Copilot+ hardware | Not supported |
 | Android | Coming soon; details to be determined | Not supported |
 
 Chat requires supported hardware with Apple Intelligence available and enabled.
@@ -25,11 +26,14 @@ Image input, token usage metadata, and explicit native tool-calling modes requir
 OS 27+ and a bridge built with Xcode 27. Image input also requires a ready
 vision-capable model.
 
+Windows chat requires an MSIX-packaged app declaring `systemAIModels`, a
+compatible Windows App SDK, and the applicable model-access configuration.
+
 ## Install
 
 | Package | Purpose |
 |---------|---------|
-| `Microsoft.Maui.Essentials.AI` | Apple on-device chat and text embeddings |
+| `Microsoft.Maui.Essentials.AI` | Apple and Windows on-device chat, plus Apple text embeddings |
 
 ```bash
 dotnet add package Microsoft.Maui.Essentials.AI --prerelease
@@ -61,6 +65,25 @@ var status = await AppleIntelligenceChatClient.GetModelStatusAsync();
 if (status.Availability != ChatModelAvailability.Available)
     Console.WriteLine(status.UnavailableReason);
 ```
+
+Register and explicitly prepare Windows AI in a supported packaged app:
+
+```csharp
+#if WINDOWS
+if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 26100))
+{
+    builder.Services.AddSingleton<IChatClient>(new WindowsAIChatClient());
+}
+#endif
+```
+
+```csharp
+var status = await WindowsAIChatClient.GetModelStatusAsync();
+if (status.Availability == ChatModelAvailability.NotReady)
+    await WindowsAIChatClient.EnsureReadyAsync(cancellationToken);
+```
+
+Ordinary generation never initiates Windows model setup or download.
 
 Use the injected `IChatClient` (`chat`) for requests:
 
@@ -224,6 +247,7 @@ The corresponding model asset must be installed.
 
 - [Chat provider implementation guide](https://github.com/dotnet/maui-labs/blob/main/docs/ai/local-chat-provider.md) — shared behavior and provider policy.
 - [Apple Foundation Models](https://github.com/dotnet/maui-labs/blob/main/docs/ai/apple-foundation-models.md) — Apple toolchain, images, availability, bridge mechanics, and validation.
+- [Windows AI language models](https://github.com/dotnet/maui-labs/blob/main/docs/ai/windows-ai-language-models.md) — Windows packaging, readiness, dependencies, and validation.
 - [Chat Playground](https://github.com/dotnet/maui-labs/tree/main/samples/AIExtensions.Sample.ChatPlayground)
 - [Essentials AI sample](https://github.com/dotnet/maui-labs/tree/main/samples/EssentialsAISample)
 - [Source and contributor build instructions](https://github.com/dotnet/maui-labs/tree/main/src/AI)

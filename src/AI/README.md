@@ -12,17 +12,17 @@ on-device chat and embeddings through `Microsoft.Extensions.AI`.
 | [Package README](Microsoft.Maui.Essentials.AI/README.md) | Consumer installation, setup, examples, and capability tables |
 | [Chat provider implementation guide](../../docs/ai/local-chat-provider.md) | Shared provider rules and reviewed platform implementation targets |
 | [Apple Foundation Models](../../docs/ai/apple-foundation-models.md) | Apple toolchain, availability, images, native bridge, and validation |
+| [Windows AI language models](../../docs/ai/windows-ai-language-models.md) | Windows packaging, dependencies, model setup, and validation |
 | [Chat Playground](../../samples/AIExtensions.Sample.ChatPlayground/README.md) | Interactive provider comparison and diagnostics |
 
 Apple chat is supported on iOS, Mac Catalyst, and macOS 26+ with Apple Intelligence
 enabled. NaturalLanguage embeddings require iOS 13+, Mac Catalyst 13.1+, or
-macOS 10.15+. Windows and Android chat providers are **coming soon**; their
-reviewed implementation targets are defined in the shared implementation guide,
-not claims of platform validation.
+macOS 10.15+. Windows AI chat is supported on eligible Windows 11 24H2+
+Copilot+ systems. Android chat remains **coming soon**.
 
 | Package | Purpose |
 |---------|---------|
-| `Microsoft.Maui.Essentials.AI` | Apple on-device chat, tools, structured output, and text embeddings |
+| `Microsoft.Maui.Essentials.AI` | Apple and Windows on-device chat, plus Apple text embeddings |
 
 For installation and a quick start, see the [package README](Microsoft.Maui.Essentials.AI/README.md).
 
@@ -31,6 +31,7 @@ For installation and a quick start, see the [package README](Microsoft.Maui.Esse
 - The .NET SDK pinned in the repository `global.json`.
 - Matching MAUI workloads.
 - macOS with Xcode 27 for the Apple native bridge and OS 27 APIs.
+- Windows build and packaging tools for the Windows target and MSIX app heads.
 
 ## Build
 
@@ -44,6 +45,16 @@ dotnet build src/AI/Microsoft.Maui.Essentials.AI/Microsoft.Maui.Essentials.AI.cs
 Use `net10.0-ios27.0` or `net10.0-macos27.0` for those platforms.
 `UseXcode27Preview` selects the OS 27 reference packs; it does not install or
 select Xcode.
+
+### Windows
+
+```powershell
+dotnet build src\AI\Microsoft.Maui.Essentials.AI\Microsoft.Maui.Essentials.AI.csproj `
+  -f net10.0-windows10.0.19041.0
+```
+
+Build and package Windows app heads on Windows. See the Windows platform guide
+for MSIX, capability, runtime, and physical-device validation requirements.
 
 ### Full product
 
@@ -96,7 +107,7 @@ ESSENTIALSAI_LIVE_TESTS=1 swift test --package-path src/AI/AppleNative
 
 DeviceRunners-based tests live in
 `tests/AI/Microsoft.Maui.Essentials.AI.DeviceTests`.
-Use the appropriate Apple target. Model-dependent cases are tagged
+Use the appropriate Apple or Windows target. Model-dependent cases are tagged
 `RequiresModel=true`; exclude them with:
 
 ```bash
@@ -142,6 +153,8 @@ dotnet test tests/AI/Microsoft.Maui.Essentials.AI.DeviceTests/Microsoft.Maui.Ess
   native artifact packaging.
 - `AppleNative/EssentialsAI/PlainTextDeltas.swift` and
   `StructuredJsonDeltas.swift` — native append-only streaming conversion.
+- `Microsoft.Maui.Essentials.AI/Platform/Windows/` — Windows chat, explicit
+  readiness, WinRT streaming, and request ownership.
 - `Microsoft.Maui.Essentials.AI/Platform/StreamingResponseHandler.cs` —
   managed streaming update transport.
 - `tests/AI/Microsoft.Maui.Essentials.AI.DeviceTests/Tests/` — shared

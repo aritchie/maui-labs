@@ -2,10 +2,10 @@
 
 On-device chat and text embeddings through
 [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/ai-extensions),
-backed by Apple Intelligence, Apple NaturalLanguage, and Windows AI. Chat
-supports streaming and structured JSON; Apple also supports native tool
-execution and image input on eligible systems.
-No cloud service is used.
+backed by Apple Intelligence, Apple NaturalLanguage, Windows AI, and Gemini Nano.
+Chat capabilities vary by platform; Apple supports native tool execution and
+eligible image input, Windows supports structured JSON, and Android supports
+in-memory image input. No cloud service is used.
 
 > **Experimental:** this package ships as a preview. APIs may change.
 
@@ -13,13 +13,13 @@ No cloud service is used.
 
 Requires .NET 10 and matching MAUI workloads.
 
-| Platform | Chat | Text embeddings |
-|----------|------|-----------------|
-| iOS | Apple Intelligence, OS 26+ | NaturalLanguage, OS 13+ |
-| Mac Catalyst | Apple Intelligence, OS 26+ | NaturalLanguage, OS 13.1+ |
-| macOS | Apple Intelligence, OS 26+ | NaturalLanguage, OS 10.15+ |
-| Windows | Windows AI on Windows 11 24H2+ and supported Copilot+ hardware | Not supported |
-| Android | Coming soon; details to be determined | Not supported |
+| Platform | Chat (`IChatClient`) | Image input | Embeddings (`IEmbeddingGenerator`) |
+|----------|---------------------|-------------|-----------------------------------|
+| iOS 26+ | Apple Intelligence, including tools and structured responses | OS 27+ with a ready vision model | NaturalLanguage, OS 13+ |
+| Mac Catalyst 26+ | Apple Intelligence, including tools and structured responses | OS 27+ with a ready vision model | NaturalLanguage, OS 13.1+ |
+| macOS 26+ | Apple Intelligence, including tools and structured responses | OS 27+ with a ready vision model | NaturalLanguage, OS 10.15+ |
+| Windows 11 24H2+ | Windows AI on supported Copilot+ hardware, including structured responses | Not supported | Not supported |
+| Android API 26+ | Gemini Nano on a supported AICore device | In-memory images | Not supported |
 
 Chat requires supported hardware with Apple Intelligence available and enabled.
 Image input, token usage metadata, and explicit native tool-calling modes require
@@ -33,16 +33,13 @@ compatible Windows App SDK, and the applicable model-access configuration.
 
 | Package | Purpose |
 |---------|---------|
-| `Microsoft.Maui.Essentials.AI` | Apple and Windows on-device chat, plus Apple text embeddings |
+| `Microsoft.Maui.Essentials.AI` | Apple, Windows, and Android on-device chat, plus Apple text embeddings |
 
 ```bash
 dotnet add package Microsoft.Maui.Essentials.AI --prerelease
 ```
 
-## Quick start
-
-Register the chat client only on a supported Apple runtime. For other platforms,
-leave chat unavailable or supply an explicit app-selected fallback.
+Register the appropriate client on a supported platform:
 
 ```csharp
 using Microsoft.Extensions.AI;
@@ -55,8 +52,30 @@ if (OperatingSystem.IsIOSVersionAtLeast(26) ||
 {
     builder.Services.AddSingleton<IChatClient>(new AppleIntelligenceChatClient());
 }
+#elif ANDROID
+builder.Services.AddSingleton<IChatClient>(new GeminiNanoChatClient());
 #endif
 ```
+
+On Android, start and monitor a model download only after an explicit app or
+user decision:
+
+```csharp
+var status = await GeminiNanoChatClient.GetModelStatusAsync(cancellationToken);
+if (status.Availability == ChatModelAvailability.NotReady)
+{
+    await GeminiNanoChatClient.PrepareModelAsync(cancellationToken);
+}
+```
+
+Gemini Nano supports text, in-memory images, streaming, and input-token usage.
+It rejects structured output and required tool invocation; Auto tool definitions
+are ignored and historical calls/results are replayed as text. `PrepareModelAsync`
+waits for the explicit download to finish. Use `DownloadModelAsync` when the app
+needs to display ML Kit's native progress, and query model status afterward
+before enabling generation.
+
+## Quick start
 
 Check availability with the concrete client before offering chat:
 
@@ -248,6 +267,7 @@ The corresponding model asset must be installed.
 - [Chat provider implementation guide](https://github.com/dotnet/maui-labs/blob/main/docs/ai/local-chat-provider.md) — shared behavior and provider policy.
 - [Apple Foundation Models](https://github.com/dotnet/maui-labs/blob/main/docs/ai/apple-foundation-models.md) — Apple toolchain, images, availability, bridge mechanics, and validation.
 - [Windows AI language models](https://github.com/dotnet/maui-labs/blob/main/docs/ai/windows-ai-language-models.md) — Windows packaging, readiness, dependencies, and validation.
+- [Gemini Nano Android](https://github.com/dotnet/maui-labs/blob/main/docs/ai/gemini-nano-android.md) — Android binding, AICore readiness, download, and validation.
 - [Chat Playground](https://github.com/dotnet/maui-labs/tree/main/samples/AIExtensions.Sample.ChatPlayground)
 - [Essentials AI sample](https://github.com/dotnet/maui-labs/tree/main/samples/EssentialsAISample)
 - [Source and contributor build instructions](https://github.com/dotnet/maui-labs/tree/main/src/AI)

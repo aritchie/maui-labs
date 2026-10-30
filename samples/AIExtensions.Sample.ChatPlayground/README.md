@@ -1,10 +1,8 @@
 # AI Chat Playground
 
-A .NET MAUI sample for comparing Apple Intelligence, Windows AI, Azure OpenAI,
-and offline Replay through the same chat UI. It runs on Android, iOS, Mac Catalyst,
-and Windows (not native macOS); providers vary by platform.
-An Android on-device provider is **coming soon**; its capabilities and setup
-are not specified yet.
+A .NET MAUI sample for comparing Apple Intelligence, Windows AI, Gemini Nano,
+Azure OpenAI, and offline Replay through the same chat UI. It runs on Android,
+iOS, Mac Catalyst, and Windows (not native macOS); providers vary by platform.
 
 ## What you can try
 
@@ -16,7 +14,7 @@ Chat, Embeddings, and Images have separate providers and capabilities.
 |----------|------|-------------|-------|-----------------|
 | Apple Intelligence | iOS / Mac Catalyst 26+ on supported hardware | OS 27+ with a ready vision model | Supported | Supported |
 | Windows AI | Windows 11 24H2+ on supported Copilot+ hardware | Not supported | Not supported | Supported |
-| Android on-device (coming soon) | Not specified | Not specified | Not specified | Not specified |
+| Gemini Nano | Android API 26+ on supported AICore hardware | In-memory images | Not supported | Not supported |
 | Azure OpenAI | Configured Responses API deployment | Supported by compatible deployments | Supported by compatible deployments | Supported by compatible deployments |
 | Replay | Recorded responses | No new image input | Recorded activity, no execution | Recorded responses |
 
@@ -39,7 +37,7 @@ Generate text vectors, index imported documents, and search their content.
 | Apple NaturalLanguage | Supported with the language asset | Supported | Supported |
 | Azure OpenAI | Configured embedding deployment | Supported | Supported |
 | Windows on-device | Not supported | Not supported | Not supported |
-| Android on-device | Not specified | Not specified | Not specified |
+| Android on-device | Not supported | Not supported | Not supported |
 
 ### Image generation
 
@@ -50,7 +48,7 @@ input does not imply image-generation support.
 |----------|------------------|
 | Apple on-device | Not supported |
 | Windows on-device | Coming soon |
-| Android on-device | Not specified |
+| Android on-device | Not supported |
 | Azure OpenAI | Supported by the configured image deployment |
 
 ## Diagnostics
@@ -96,8 +94,12 @@ for hardware, capability, packaging, and access requirements.
 
 ### Android
 
-Android currently runs the Azure and Replay providers; the on-device provider
-is coming soon. With Java and the Android SDK installed:
+The Android app requires API 26+ and supported AICore hardware/configuration for
+Gemini Nano. It supports text/image chat, not tools or structured JSON.
+The first request never downloads assets: explicitly enumerate
+`GeminiNanoChatClient.DownloadModelAsync` after a download decision and query
+status again before chatting. There is no download UI or automatic cloud fallback.
+See the [Android guide](../../docs/ai/gemini-nano-android.md).
 
 ```sh
 dotnet run --project samples/AIExtensions.Sample.ChatPlayground/AIExtensions.Sample.ChatPlayground.csproj \
